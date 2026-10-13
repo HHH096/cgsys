@@ -1,0 +1,11 @@
+# Procurement system dependencies (Python 3.9)
+#
+# Keep this file ASCII-only. pip reads requirements files with the system
+# locale codec (GBK on Chinese Windows) and will crash on UTF-8 Chinese
+# comments with "UnicodeDecodeError: 'gbk' codec can't decode".
+fastapi>=0.100,<1.0
+uvicorn>=0.23,<1.0
+openpyxl>=3.1,<4.0
+python-multipart>=0.0.6
+pymupdf>=1.23
+segno>=1.5              # QR code for the "share with the team" page

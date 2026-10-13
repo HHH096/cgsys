@@ -1,0 +1,358 @@
+:root {
+  --green: #006600;
+  --line: #dfe3e8;
+  --bg: #f6f7f9;
+  --warn: #fff8d6;
+  --err: #c0392b;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: #222;
+  font: 14px/1.5 "Microsoft YaHei", "等线", system-ui, sans-serif;
+}
+
+.topbar {
+  display: flex; align-items: center; gap: 12px;
+  padding: 10px 18px;
+  background: var(--green);
+  color: #fff;
+  position: sticky; top: 0; z-index: 5;
+}
+.brand { font-size: 17px; font-weight: 700; }
+.brand .muted { color: #bfe3bf; font-weight: 400; }
+.ident { margin-left: auto; display: flex; align-items: center; gap: 8px; }
+.ident label { color: #d8f0d8; }
+
+main { padding: 16px; max-width: 1500px; margin: 0 auto; }
+
+.card {
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 14px 16px;
+  margin-bottom: 14px;
+}
+.card h2 { font-size: 15px; margin: 0 0 10px; }
+
+.row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.row label { color: #555; }
+.spacer { flex: 1; }
+.inline { display: inline-flex; align-items: center; gap: 5px; }
+
+input, select, button, textarea {
+  font: inherit;
+  padding: 6px 8px;
+  border: 1px solid #ccd2d9;
+  border-radius: 5px;
+  background: #fff;
+}
+input:focus, select:focus { outline: 2px solid #b7dcb7; border-color: var(--green); }
+
+button { cursor: pointer; }
+button.primary { background: var(--green); color: #fff; border-color: var(--green); }
+button.primary:hover { background: #004c00; }
+button.ghost { background: #fff; color: #333; }
+button.ghost:hover { background: #eef3ee; }
+button:disabled { opacity: .5; cursor: not-allowed; }
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 10px 14px;
+  margin-bottom: 10px;
+}
+.grid label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: #555; }
+.grid input { width: 100%; }
+
+.pill {
+  padding: 2px 10px; border-radius: 20px; font-size: 12px;
+  background: #e8f5e8; color: var(--green); border: 1px solid #bfe3bf;
+}
+.pill.locked { background: #fdecea; color: var(--err); border-color: #f5c6c0; }
+
+.splitbar {
+  margin-top: 10px; display: flex; gap: 18px; flex-wrap: wrap;
+  font-size: 13px; color: #444;
+}
+.splitbar b { color: #111; }
+.splitbar .hi { color: #b8860b; }
+
+.tablewrap { overflow: auto; max-height: 60vh; }
+table { border-collapse: collapse; width: 100%; font-size: 13px; }
+th, td { border: 1px solid var(--line); padding: 5px 7px; text-align: center; white-space: nowrap; }
+th { background: var(--green); color: #fff; position: sticky; top: 0; }
+tbody tr:nth-child(even) { background: #fafbfc; }
+tbody tr.needs-contract { background: var(--warn); }
+tbody tr:hover { background: #eef7ee; }
+td.left { text-align: left; }
+tfoot td { background: #fffbe0; font-weight: 700; }
+
+.msg { margin-top: 8px; font-size: 13px; white-space: pre-line; }
+.msg.error { color: var(--err); }
+.msg.warn { color: #8a6d00; }
+.muted { color: #888; }
+.small { font-size: 12px; }
+
+.toast {
+  position: fixed; bottom: 22px; left: 50%; transform: translateX(-50%);
+  background: #222; color: #fff; padding: 9px 16px; border-radius: 6px;
+  opacity: 0; pointer-events: none; transition: opacity .2s;
+  max-width: 80vw;
+}
+.toast.show { opacity: .95; }
+.toast.error { background: var(--err); }
+
+/* 视图切换（全部 / 待下单 / 缺发票） */
+.views { display: flex; gap: 6px; margin-left: 12px; flex-wrap: wrap; }
+.viewbtn {
+  background: #fff; border: 1px solid #ccd2d9; border-radius: 20px;
+  padding: 3px 12px; font-size: 13px; color: #333;
+}
+.viewbtn:hover { background: #eef3ee; }
+.viewbtn.active { background: var(--green); color: #fff; border-color: var(--green); }
+.viewbtn b { font-weight: 700; }
+
+/* 条目表上方那个搜索框 */
+.searchinp {
+  padding: 4px 8px; font-size: 13px; border: 1px solid #ccd2d9;
+  border-radius: 6px; width: 200px; max-width: 44vw;
+}
+
+/* 行内小按钮 */
+.mini {
+  padding: 2px 7px; font-size: 12px; border-radius: 4px;
+  background: #fff; border: 1px solid #ccd2d9; margin: 0 2px; color: #333;
+}
+.mini:hover { background: #eef3ee; }
+.mini.danger { color: var(--err); border-color: #f0c8c2; }
+.mini.danger:hover { background: #fdecea; }
+
+/* 行内状态下拉 */
+.cellselect { padding: 2px 4px; font-size: 12px; border-radius: 4px; }
+.cellselect.done {
+  background: #e8f5e8; border-color: #bfe3bf; color: #0a5a0a; font-weight: 600;
+}
+
+/* 发票文件 */
+.invcell { white-space: nowrap; }
+.invfile { display: inline-flex; align-items: center; gap: 3px; margin-right: 6px; }
+.invfile a {
+  font-size: 12px; text-decoration: none; color: var(--green);
+  border: 1px solid #bfe3bf; border-radius: 4px; padding: 1px 5px;
+}
+.invfile a:hover { background: #eef7ee; }
+
+/* 进度条上的提示 */
+.warnpill {
+  background: #fff4d6; color: #8a6d00; border: 1px solid #f0dca0;
+  border-radius: 20px; padding: 1px 10px; font-size: 12px;
+}
+.okpill {
+  background: #e8f5e8; color: var(--green); border: 1px solid #bfe3bf;
+  border-radius: 20px; padding: 1px 10px; font-size: 12px;
+}
+/* 进度条上那种「点一下看这些行」的提示 */
+.warnpill.link { cursor: pointer; text-decoration: underline dotted; }
+.warnpill.link:hover { background: #ffeab0; }
+
+/* 行内「填金额」：有发票却没实付金额，一眼就要看见 */
+.mini.warnmini {
+  background: #fff4d6; border-color: #f0dca0; color: #8a6d00; font-weight: 600;
+}
+.mini.warnmini:hover { background: #ffe9b0; }
+
+/* 粘贴分享文案快速填入 */
+.pastebar { display: flex; gap: 8px; align-items: stretch; margin-bottom: 8px; }
+.pastebar textarea {
+  flex: 1; min-height: 46px; resize: vertical;
+  font: inherit; padding: 7px 9px;
+  border: 1px solid #ccd2d9; border-radius: 5px; background: #fbfdfb;
+}
+.pastebar textarea:focus { outline: 2px solid #b7dcb7; border-color: var(--green); }
+.pastebar button { white-space: nowrap; padding: 0 18px; }
+
+/* 回填车队总表的行块 */
+#blockText {
+  width: 100%; min-height: 110px; margin-top: 8px;
+  font: 12px/1.5 Consolas, "Courier New", monospace;
+  padding: 8px; border: 1px solid #ccd2d9; border-radius: 5px;
+  background: #fbfdfb; resize: vertical; white-space: pre; overflow: auto;
+}
+#blockText:focus { outline: 2px solid #b7dcb7; border-color: var(--green); }
+
+/* 邮箱收发票 */
+#mailConfigBox { margin: 8px 0; }
+#mailConfigBox summary {
+  cursor: pointer; font-size: 13px; color: var(--green); margin-bottom: 8px;
+}
+#mailPending { margin-top: 10px; }
+.mailcard {
+  border: 1px solid var(--line); border-radius: 6px;
+  padding: 9px 11px; margin-bottom: 8px; background: #fbfdfb;
+}
+.mailcard .subj { font-weight: 600; }
+.mailcard .meta { color: #888; font-size: 12px; margin-top: 2px; }
+.mailcard .row { margin-top: 7px; }
+.sugg {
+  display: inline-flex; align-items: center; gap: 4px;
+  border: 1px solid #bfe3bf; background: #f2faf2; color: #0a5a0a;
+  border-radius: 20px; padding: 2px 10px; font-size: 12px; margin: 2px 5px 2px 0;
+  cursor: pointer;
+}
+.sugg:hover { background: #e4f5e4; }
+
+/* 分享给组员 */
+.sharebox {
+  display: flex; gap: 18px; align-items: center; flex-wrap: wrap; margin-top: 10px;
+}
+.sharebox img {
+  width: 176px; height: 176px; border: 1px solid var(--line);
+  border-radius: 6px; background: #fff; padding: 4px;
+}
+.sharebox img[hidden] { display: none; }
+.sharetext { display: flex; flex-direction: column; gap: 6px; }
+.shareurl {
+  font: 16px/1.4 Consolas, "Courier New", monospace;
+  color: var(--green); font-weight: 700; word-break: break-all;
+}
+
+/* 两个入口：按 html 上的 mode-* 决定显示哪些区块。
+   记住这只是体验层 —— 真正的拦截在服务端（没登录调采购接口一律 401）。 */
+html.mode-member .purchase-only { display: none !important; }
+html.mode-purchase .member-only { display: none !important; }
+
+/* 采购入口的登录门 */
+.logingate {
+  position: fixed; inset: 0; z-index: 50;
+  background: rgba(18, 28, 20, .55);
+  display: flex; align-items: center; justify-content: center; padding: 20px;
+}
+.logingate[hidden] { display: none; }
+.loginbox {
+  background: #fff; border-radius: 10px; padding: 26px 28px;
+  width: min(380px, 100%); box-shadow: 0 12px 40px rgba(0, 0, 0, .28);
+  display: flex; flex-direction: column; gap: 12px;
+}
+.loginbox h2 { margin: 0; font-size: 19px; }
+.loginbox input {
+  padding: 9px 11px; border: 1px solid var(--line); border-radius: 6px; font-size: 15px;
+}
+
+/* 组员界面的进度数字 */
+.progbar { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 6px; }
+.progbar .prog {
+  flex: 1 1 130px; border: 1px solid var(--line); border-radius: 8px;
+  padding: 10px 12px; background: #fafcfa;
+}
+.progbar .prog b { display: block; font-size: 22px; line-height: 1.2; color: var(--green); }
+.progbar .prog span { font-size: 12px; color: #667; }
+
+/* 组员看到的只读状态（不是下拉框） */
+.cellselect.readonly {
+  display: inline-block; padding: 3px 8px; border-radius: 5px;
+  background: #f2f5f2; color: #556; border: 1px solid var(--line);
+}
+.cellselect.readonly.done {
+  background: #e4f5e4; color: #2c6b2c; border-color: #b6dcb6;
+}
+
+/* 已退货的行：整行压暗一点，名称划掉，旁边挂个标记 */
+tr.refunded td { background: #fbf6f6; color: #8a8a8a; }
+tr.refunded td:nth-child(2) { text-decoration: line-through; }
+.refundtag {
+  display: inline-block; margin-left: 6px; padding: 1px 6px;
+  font-size: 11px; line-height: 1.5; border-radius: 4px;
+  text-decoration: none;
+  background: #f6e6e6; color: #a33; border: 1px solid #e3cccc;
+}
+
+/* 分享卡片里的分隔线与宽输入框 */
+.sep { border: 0; border-top: 1px solid var(--line); margin: 14px 0 10px; }
+.wideinp {
+  flex: 1 1 260px; min-width: 200px;
+  padding: 7px 10px; border: 1px solid var(--line); border-radius: 6px;
+  font: inherit;
+}
+
+/* 垫资标记：挂在「申购人」那列下面 */
+.payertag {
+  display: block; margin-top: 2px;
+  font-size: 11px; line-height: 1.5; color: #8a6d1f;
+}
+
+/* 组员管理：新加的那一行给点提示色 */
+tr.newrow td { background: #fffbe8; }
+#memTable input:not([type="checkbox"]) {
+  width: 100%; min-width: 5em;
+  padding: 3px 6px; border: 1px solid var(--line); border-radius: 4px; font: inherit;
+}
+/* 当前视图合计：贴在表格下面，不跟数据行连成一片 */
+.itemsum {
+  display: flex; flex-wrap: wrap; gap: 16px; align-items: baseline;
+  margin-top: 8px; padding: 9px 12px;
+  background: var(--warn); border: 1px solid var(--line); border-radius: 6px;
+  font-size: 13px;
+}
+.itemsum .sumrow { font-weight: 600; }
+.itemsum .sumitem b { font-size: 15px; }
+/* 没有数据时别留一条空黄带 —— `display: flex` 会盖掉 [hidden] 的 display:none */
+.itemsum[hidden] { display: none; }
+
+/* 一票多单的核对框：要能放下「明细 / 选条目 / 金额」三列 */
+.widebox { width: min(680px, 100%); }
+#assignTable { width: 100%; border-collapse: collapse; font-size: 13px; }
+#assignTable th, #assignTable td {
+  border: 1px solid var(--line); padding: 5px 7px; text-align: left;
+}
+#assignTable th { background: var(--green); color: #fff; }
+#assignTable select, #assignTable input { width: 100%; font: inherit; }
+#assignTable td:first-child { max-width: 15em; word-break: break-all; }
+#assignTable td:last-child { width: 6em; }
+#assignSum { margin: 8px 0 0; font-size: 13px; }
+#assignSum.bad { color: #b3261e; font-weight: 600; }
+#assignSum.good { color: #1b7f3b; }
+
+/* 「网址链接/商家」列：长链接只显示短标签，列宽限死，点开是新标签页 */
+#itemsTable td a { color: var(--green); text-decoration: underline; }
+#itemsTable td:nth-child(12) {
+  max-width: 12em; overflow: hidden; text-overflow: ellipsis;
+}
+
+/* 页面内输入框：替代 window.prompt（部分内嵌浏览器不弹它，点了像没反应） */
+.askbar {
+  position: fixed; inset: 0; z-index: 50;
+  background: rgba(0, 0, 0, .35);
+  display: flex; align-items: center; justify-content: center; padding: 16px;
+}
+.askbar[hidden] { display: none; }
+.askbox {
+  background: #fff; border-radius: 10px; padding: 16px 18px;
+  width: min(420px, 100%); box-shadow: 0 10px 30px rgba(0, 0, 0, .2);
+}
+.askbox p { margin: 0 0 10px; font-size: 14px; }
+.askbox input {
+  width: 100%; padding: 9px 10px; font: inherit; box-sizing: border-box;
+  border: 1px solid var(--line); border-radius: 6px;
+}
+.askbox .row { justify-content: flex-end; gap: 8px; margin-top: 12px; }
+
+/* 「存/删」（成员表）和「改/删」（条目表）都钉在右边。
+   手机上表格要横向滑，不钉住这一列会被挤出屏幕，人根本点不到 ——
+   就会以为"填完了却存不上"。（真发生过）*/
+#itemsTable td:last-child, #itemsTable th:last-child,
+#memTable td:last-child, #memTable th:last-child {
+  position: sticky; right: 0; z-index: 1; white-space: nowrap;
+}
+#itemsTable td:last-child, #memTable td:last-child { background: #fff; }
+#itemsTable tbody tr:nth-child(even) td:last-child,
+#memTable tbody tr:nth-child(even) td:last-child { background: #fafbfc; }
+#memTable tr.newrow td:last-child { background: #fffbe8; }
+
+/* 改挂弹窗里的多选列表 */
+#pickList { width: 100%; box-sizing: border-box; font: inherit;
+  border: 1px solid var(--line); border-radius: 6px; padding: 4px; }
+#pickList option { padding: 4px 6px; }

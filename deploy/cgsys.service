@@ -1,0 +1,29 @@
+; 采购系统的 systemd 单元模板
+;
+; 用法（把路径换成你机器上的实际路径）：
+;     cp deploy/cgsys.service /etc/systemd/system/cgsys.service
+;     systemctl daemon-reload
+;     systemctl enable --now cgsys
+;     systemctl status cgsys
+;
+; 更新代码之后：systemctl restart cgsys
+; 看日志：      journalctl -u cgsys -n 50 --no-pager
+
+[Unit]
+Description=采购系统（电气组）
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/cgsys
+; 用项目自己的 venv；端口跟 main.py 的参数一致
+ExecStart=/opt/cgsys/.venv/bin/python -m app.main 8000
+Restart=always
+RestartSec=3
+
+; 想更规范就建个专用用户，并把 /opt/cgsys 的属主改过去（改前先停服务、备份 data/）
+;User=cgsys
+;Group=cgsys
+
+[Install]
+WantedBy=multi-user.target

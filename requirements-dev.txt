@@ -1,0 +1,6 @@
+# Dev/test dependencies. Not needed for deployment, so the launcher skips it.
+#
+# ASCII-only for the same reason as requirements.txt: pip reads requirements
+# files with the system locale codec, and a UTF-8 comment makes it crash.
+-r requirements.txt
+httpx>=0.24,<1.0

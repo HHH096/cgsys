@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>采购系统 · 电气组</title>
+<link rel="stylesheet" href="styles.css">
+<script>
+/* 在渲染之前就把模式定下来，免得先闪一下采购界面。
+   /purchase = 采购人员入口（要密码）；其它路径 = 组员入口。 */
+document.documentElement.className =
+  location.pathname.replace(/\/+$/, '').toLowerCase() === '/purchase'
+    ? 'mode-purchase' : 'mode-member';
+</script>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">采购系统 <span class="muted">电气组</span></div>
+  <div class="ident">
+    <label>我是</label>
+    <select id="who"></select>
+    <button id="addMember" class="ghost purchase-only" type="button">+ 组员</button>
+    <button id="logout" class="ghost purchase-only" type="button">退出</button>
+  </div>
+</header>
+
+<!-- 采购入口的登录门：没登录时挡住整个工作台。
+     注意这只是体验层 —— 真正的拦截在服务端（没登录调采购接口一律 401）。 -->
+<div id="loginGate" class="logingate" hidden>
+  <form id="loginForm" class="loginbox">
+    <h2 id="loginTitle">采购人员登录</h2>
+    <p id="loginHint" class="muted small"></p>
+    <input id="loginPw" type="password" placeholder="采购入口密码"
+           autocomplete="current-password">
+    <input id="loginPw2" type="password" placeholder="再输一遍"
+           autocomplete="new-password" hidden>
+    <div id="loginMsg" class="msg"></div>
+    <button class="primary" type="submit" id="loginBtn">进入采购工作台</button>
+  </form>
+</div>
+
+<!-- 组员入口的口令门：全组共用一个口令。
+     和采购登录门一样，这只是体验层 —— 真正的拦截在服务端（没解锁一律 401）。 -->
+<div id="memberGate" class="logingate" hidden>
+  <form id="memberForm" class="loginbox">
+    <h2 id="memberTitle">填采购需求</h2>
+    <p id="memberHint" class="muted small"></p>
+    <input id="memberPw" type="password" placeholder="组员口令"
+           autocomplete="current-password">
+    <div id="memberMsg" class="msg"></div>
+    <button class="primary" type="submit" id="memberBtn">进去填</button>
+  </form>
+</div>
+
+<main>
+
+  <section class="card">
+    <div class="row">
+      <label>采购轮次</label>
+      <select id="roundSelect"></select>
+      <button id="newRound" class="ghost purchase-only" type="button">+ 新建轮次</button>
+      <span id="roundStatus" class="pill"></span>
+      <span class="spacer"></span>
+      <button id="lockRound" class="ghost purchase-only" type="button">锁定本轮</button>
+      <button id="exportXlsx" class="primary purchase-only" type="button">导出采购表 .xlsx</button>
+    </div>
+    <div id="splitBar" class="splitbar purchase-only"></div>
+    <div id="progressBar" class="splitbar"></div>
+  </section>
+
+  <!-- 组员也能看的进度：只回数字，不列别人的条目 -->
+  <section class="card member-only">
+    <div class="row">
+      <h2>本轮进度</h2>
+      <span class="spacer"></span>
+      <span class="muted small">负责采购的同学推进到哪里，这里的数字就会跟着变</span>
+    </div>
+    <div id="memberProgress" class="progbar"></div>
+  </section>
+
+  <section class="card">
+    <h2 id="formTitle">新增采购条目</h2>
+    <form id="itemForm" autocomplete="off">
+      <input type="hidden" id="itemId">
+
+      <div class="pastebar">
+        <textarea id="shareText" rows="2"
+          placeholder="快速填入：把淘宝 / 闲鱼里「分享 → 复制链接」的整段内容粘在这里，点「识别」自动填名称、链接、价格"></textarea>
+        <button type="button" id="parseShare" class="ghost">识别</button>
+      </div>
+      <div id="parseMsg" class="msg"></div>
+
+      <div class="grid">
+        <label>物料名称/品牌 *<input id="f_name" required></label>
+        <label>规格型号<input id="f_spec"></label>
+        <label>申请数量 *<input id="f_qty" type="number" step="any" min="0" required></label>
+        <label>单位 *<input id="f_unit" list="units" required></label>
+        <datalist id="units">
+          <option>个</option><option>套</option><option>条</option><option>张</option>
+          <option>米</option><option>组</option><option>箱</option><option>把</option>
+          <option>对</option><option>双</option><option>瓶</option><option>包</option>
+          <option>公斤</option><option>次</option><option>辆</option><option>根</option>
+        </datalist>
+        <label>预计单价 *<input id="f_price" type="number" step="any" min="0" required></label>
+        <label>运费<input id="f_freight" type="number" step="any" min="0" value="0"></label>
+        <label>用途<input id="f_purpose"></label>
+        <label>网址链接 / 商家<input id="f_url" placeholder="淘宝链接或商家名称（用来分组拆分）"></label>
+        <label>备注<input id="f_note"></label>
+        <label>实付金额<input id="f_paid" type="number" step="any" min="0"></label>
+        <label>谁垫的钱<input id="f_payer" list="payers" placeholder="自己先垫的才填"></label>
+        <datalist id="payers"></datalist>
+      </div>
+      <div class="row">
+        <span id="calcHint" class="muted"></span>
+        <span class="spacer"></span>
+        <button type="button" id="resetForm" class="ghost">清空</button>
+        <button type="submit" class="primary" id="submitItem">保存条目</button>
+      </div>
+      <div id="formMsg" class="msg"></div>
+    </form>
+  </section>
+
+  <section class="card purchase-only">
+    <div class="row">
+      <h2>邮箱收发票</h2>
+      <span id="mailHint" class="muted small"></span>
+      <span class="spacer"></span>
+      <button id="mailTest" class="ghost" type="button">测试连接</button>
+      <button id="mailFetch" class="primary" type="button">立即收取</button>
+    </div>
+
+    <details id="mailConfigBox">
+      <summary>邮箱设置</summary>
+      <div class="grid">
+        <label>邮箱类型<select id="m_preset"></select></label>
+        <label>服务器<input id="m_host" placeholder="imap.qq.com"></label>
+        <label>端口<input id="m_port" type="number" value="993"></label>
+        <label>邮箱账号<input id="m_user" placeholder="you@qq.com"></label>
+        <label>授权码<input id="m_password" type="password" placeholder="不是登录密码"></label>
+        <label>收件夹<input id="m_folder" value="INBOX"></label>
+        <label>只收最近<input id="m_days" type="number" min="0" value="30"> 天</label>
+        <label>一次最多扫<input id="m_max" type="number" min="1" value="200"> 封</label>
+        <label>关键字<input id="m_keywords" placeholder="发票,invoice"></label>
+        <label>每<input id="m_interval" type="number" min="0" value="0"> 分钟自动收一次（0 = 不自动）</label>
+      </div>
+      <div class="row">
+        <label class="inline"><input type="checkbox" id="m_unseen"> 只收未读</label>
+        <label class="inline"><input type="checkbox" id="m_any"> 收下所有附件（不看关键字）</label>
+        <span class="spacer"></span>
+        <button id="mailSave" class="ghost" type="button">保存设置</button>
+      </div>
+      <p class="muted small">
+        <b>授权码不是登录密码</b>：QQ 邮箱在「设置 → 账号 → IMAP/SMTP 服务」里开启并生成；
+        163 在「设置 → POP3/SMTP/IMAP」里开。授权码做混淆后存在本机，不会明文躺着。
+      </p>
+    </details>
+
+    <div id="mailMsg" class="msg"></div>
+    <div id="mailPending"></div>
+  </section>
+
+  <section class="card purchase-only">
+    <div class="row">
+      <h2>发票合并打印</h2>
+      <label class="inline">每页
+        <select id="mergePerPage">
+          <option value="1">1</option>
+          <option value="2" selected>2</option>
+          <option value="3">3</option>
+          <option value="4">4</option>
+        </select> 张
+      </label>
+      <label class="inline"><input type="checkbox" id="mergeBack" checked> 生成背面</label>
+      <label class="inline"><input type="checkbox" id="mergeFrame" checked> 背面外框/横线</label>
+      <span class="spacer"></span>
+      <span id="mergeHint" class="muted small"></span>
+      <button id="mergePdf" class="primary" type="button">生成并下载</button>
+      <button id="invoicesZip" class="ghost" type="button">打包下载发票 zip</button>
+    </div>
+    <p class="muted small">
+      把本轮收到的发票按 A4 每页 N 张合成一份 PDF：正面是发票，背面是它对应的采购信息
+      （物品名称 / 用途 / 组别 / 付款日期（留空手写）/ 归属表格（印「月」，左侧留白写月份数字））。
+      双面打印时选「长边翻转（长边装订）」，每张发票背面就是它自己的信息。
+    </p>
+  </section>
+
+  <section class="card purchase-only">
+    <div class="row">
+      <h2>回填车队总表</h2>
+      <span id="blockHint" class="muted small"></span>
+      <span class="spacer"></span>
+      <button id="blockCopy" class="ghost" type="button">全选复制</button>
+      <button id="blockXlsx" class="ghost" type="button">导出 xlsx</button>
+    </div>
+    <div id="blockRecon" class="splitbar"></div>
+    <p class="muted small">
+      下面是「电气组本月行块」：列顺序与车队总表的新表头（<b>7月下旬起</b>）逐列一致，
+      <b>不含表头</b>、组别已填。点「全选复制」，去在线表格里找到对应月份 sheet 的
+      「电气组」那一块，粘到末尾就行。
+    </p>
+    <textarea id="blockText" rows="6" readonly spellcheck="false"></textarea>
+    <p id="blockCols" class="muted small"></p>
+  </section>
+
+  <section class="card">
+    <div class="row">
+      <h2>本轮条目</h2>
+      <div class="views">
+        <button type="button" class="viewbtn active" data-view="all">全部 <b id="c_all">0</b></button>
+        <button type="button" class="viewbtn purchase-only" data-view="pending_order">待下单 <b id="c_po">0</b></button>
+        <button type="button" class="viewbtn purchase-only" data-view="pending_invoice">缺发票 <b id="c_pi">0</b></button>
+        <button type="button" class="viewbtn" data-view="missing_paid">缺金额 <b id="c_mp">0</b></button>
+        <button type="button" class="viewbtn" data-view="advanced">垫资 <b id="c_adv">0</b></button>
+      </div>
+      <span class="spacer"></span>
+      <input id="itemSearch" type="search" class="searchinp" autocomplete="off"
+             placeholder="搜物料 / 规格 / 申购人 / 备注…">
+      <label class="inline purchase-only"><input type="checkbox" id="onlyMine"> 只看我的</label>
+    </div>
+    <div class="tablewrap">
+      <table id="itemsTable">
+        <thead>
+          <tr>
+            <th>#</th><th>物料名称/品牌</th><th>规格型号</th><th>数量</th><th>单位</th>
+            <th>预计单价</th><th>运费</th><th>小计金额</th><th>合计金额</th>
+            <th>用途</th><th>申购人</th><th>网址链接/商家</th><th>组别</th><th>备注</th>
+            <th>实付金额</th><th>下单状态</th><th>发票状态</th><th>发票文件</th><th>操作</th>
+          </tr>
+        </thead>
+        <tbody id="itemsBody"></tbody>
+      </table>
+    </div>
+    <!-- 当前视图合计：**放在表格外面**。原来在 tfoot 里，跟数据行连成一片，
+         看着像"表格还有一条"，容易看错。 -->
+    <div id="itemsSum" class="itemsum" hidden></div>
+    <p class="muted small">
+      小计金额 = 数量 × 预计单价；合计金额 = 小计金额 + 运费，都由系统自动算。
+      单价超过 1000 元的行会标黄，记得准备合同。
+      下单与发票状态在锁定本轮之后照样能改（下单、收发票本来就发生在汇总之后）。
+      发票支持 <b>PDF</b> 和 <b>jpg / png / bmp / tif 图片</b>（手机拍的照片也行）——
+      图片会自动转成 PDF 归档，合并打印时一视同仁。
+      照片和扫描件会再试一次 <b>OCR</b> 认金额：认出来只是<b>建议值</b>，请对一眼票面。
+    </p>
+    <p id="emptyHint" class="muted small"></p>
+  </section>
+
+  <section class="card purchase-only" id="memberCard">
+    <div class="row">
+      <h2>组员管理</h2>
+      <span id="memHint" class="muted small"></span>
+      <span class="spacer"></span>
+      <button id="memAdd" class="ghost" type="button">+ 加组员</button>
+    </div>
+    <p class="muted small">
+      名字打错、有人进队或退队，都在这儿改。改完点那一行的「**存**」。
+      删掉一个组员**不会**动他已经填过的采购条目（条目里记的是名字）。
+    </p>
+    <div class="tablewrap">
+      <table id="memTable">
+        <thead>
+          <tr><th>姓名</th><th>手机号</th>
+              <th title="勾上/取消立刻生效，不用再点「存」">采购负责人</th>
+              <th>操作</th></tr>
+        </thead>
+        <tbody id="memBody"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="card purchase-only">
+    <div class="row">
+      <h2>分享给组员</h2>
+      <span id="shareHint" class="muted small"></span>
+      <span class="spacer"></span>
+      <button id="shareRefresh" class="ghost" type="button">刷新地址</button>
+      <button id="shareCopy" class="ghost" type="button">复制地址</button>
+    </div>
+    <p class="muted small">
+      组员要和这台电脑连**同一个 WiFi / 局域网**，用手机扫下面这个码，或者直接输地址。
+      打开后右上角选自己的名字就能开始填，不用密码。
+    </p>
+    <div class="sharebox">
+      <img id="shareQr" alt="组员扫码进入">
+      <div class="sharetext">
+        <div id="shareUrl" class="shareurl"></div>
+        <div id="shareLocal" class="muted small"></div>
+      </div>
+    </div>
+
+    <hr class="sep">
+    <p class="muted small">
+      <b>组员口令</b>：全组共用一个。别人就算拿到网址，没口令也进不来 ——
+      这一点在你把服务通过隧道发布到公网之后尤其要紧。
+      <b>留空保存 = 把组员入口关掉</b>（没设口令时，组员入口一律不放行）。
+    </p>
+    <div class="row">
+      <input id="mp_password" type="password" class="wideinp"
+             placeholder="设一个全组共用的口令（至少 4 位）">
+      <span id="mp_hint" class="muted small"></span>
+      <span class="spacer"></span>
+      <button id="mp_save" class="ghost" type="button">保存口令</button>
+    </div>
+    <div id="mp_msg" class="msg"></div>
+  </section>
+
+</main>
+
+<input type="file" id="invoiceInput" hidden
+       accept=".pdf,.png,.jpg,.jpeg,.bmp,.tif,.tiff,.xml,.ofd">
+<div id="toast" class="toast"></div>
+
+<!-- 一票多单的核对框：每行明细选一条采购，金额可改 -->
+<div id="assignBar" class="askbar" hidden>
+  <div class="askbox widebox">
+    <h3 id="assignTitle">核对这张发票</h3>
+    <p id="assignMsg" class="muted small"></p>
+    <table id="assignTable">
+      <thead><tr><th>票面明细</th><th>挂到哪条采购</th><th>实付金额</th></tr></thead>
+      <tbody id="assignBody"></tbody>
+    </table>
+    <p id="assignSum"></p>
+    <div class="row">
+      <button id="assignOk" type="button">确定</button>
+      <button id="assignCancel" type="button" class="ghost">取消</button>
+    </div>
+  </div>
+</div>
+
+<!-- 名字门：**不选名字不让用**。两个入口都要过 —— 组员填的东西、
+     采购自己上手买的东西，都得挂在具体人名下。 -->
+<div id="nameGate" class="logingate" hidden>
+  <div class="loginbox">
+    <h2 id="nameGateTitle">你是谁？</h2>
+    <p id="nameGateHint" class="muted small">
+      选一个名字才能开始 —— 每条采购都要记在具体人名下，
+      不选的话那笔账不知道是谁的。选一次就记住了。
+    </p>
+    <select id="nameGateSel"></select>
+    <button id="nameGateOk" type="button">就我</button>
+    <!-- 兜底出口：名单空了 / 名字不对时，采购人员还能进去把自己加上，
+         否则管理入口就把管理员自己锁在门外了。组员看不到这个按钮。 -->
+    <button id="nameGateAdd" class="ghost purchase-only" type="button">
+      名单里没有我，先去加
+    </button>
+  </div>
+</div>
+
+<!-- 页面内的输入框。浏览器原生 prompt() 在部分内嵌浏览器（微信等）里不弹，
+     表现是"点了按钮毫无反应"，所以关键输入自己画一个。 -->
+<div id="askBar" class="askbar" hidden>
+  <div class="askbox">
+    <p id="askMsg"></p>
+    <input id="askInput" type="text" autocomplete="off">
+    <div class="row">
+      <button id="askOk" type="button">确定</button>
+      <button id="askCancel" type="button" class="ghost">取消</button>
+    </div>
+  </div>
+</div>
+
+<!-- 多选弹窗：改挂发票时选要挂到哪些条目上（一张票可以挂多条） -->
+<div id="pickBar" class="askbar" hidden>
+  <div class="askbox">
+    <p id="pickMsg"></p>
+    <select id="pickList" multiple size="8"></select>
+    <p class="muted small">一张发票可以挂多条 —— 按住 Ctrl 点（手机上直接点）可以多选。</p>
+    <div class="row">
+      <button id="pickOk" type="button">确定</button>
+      <button id="pickCancel" type="button" class="ghost">取消</button>
+    </div>
+  </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

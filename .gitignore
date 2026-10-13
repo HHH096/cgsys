@@ -1,0 +1,36 @@
+# 运行环境
+.venv/
+__pycache__/
+*.py[cod]
+
+# 运行时数据（数据库、发票、图片附件）——不要提交
+data/
+*.db
+*.db-journal
+
+# 导出的表格
+导出/
+*.log
+
+# 真实组员名单（姓名+手机号）——仓库里只放 组员名单.example.txt
+组员名单.txt
+
+# 交接 / 运维文档（含服务器地址、密钥路径、线上数据说明，不进公开仓库）
+会话交接.md
+进度同步.md
+服务器现状.md
+交给新项目.md
+交给新项目.txt
+迁移到云服务器.md
+外网访问指南.md
+
+# 打包产物 / 隧道二进制 / 会话附件
+_上传给服务器.zip
+cloudflared/
+.reasonix/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
