@@ -149,8 +149,16 @@ class TestReassignUiWiring(unittest.TestCase):
         self.assertIn('function pickItems(', self.js)
         for needle in ('id="pickBar"', 'id="pickList"', 'id="pickOk"'):
             self.assertIn(needle, self.html, needle)
-        self.assertIn('multiple', self.html)
-        self.assertIn('#pickList', self.css)
+        self.assertIn('.picklist', self.css)
+
+    def test_it_does_not_use_a_native_multiple_select(self):
+        """手机上原生多选基本没法用（要长按/Ctrl）—— 改成点一下选中、再点一下取消。"""
+        self.assertNotIn('<select id="pickList" multiple', self.html)
+        self.assertNotIn('<select id="mergeRounds" multiple', self.html)
+        seg = self.js.split('function pickItems(')[1].split('\n}')[0]
+        self.assertIn('pickitem', seg)
+        self.assertIn("classList.add('on')", seg)
+        self.assertIn("classList.remove('on')", seg)
 
     def test_it_saves_the_new_set(self):
         seg = self.js.split('function reassignInvoice(')[1].split('function ')[0]
@@ -724,3 +732,118 @@ class TestMultiLinkNaming(EntryCase):
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
+
+
+class TestRefundClearsEveryItemOnTheInvoice(TestInvoiceItems):
+    """退货要按**关联表**删票 —— 一票挂多条时，从非主条目退货也得把票删掉。
+
+    老写法查 `invoices.item_id`（只等于主条目），从第二条退货就删不掉票：
+    票留在库里、条目却成了已退货，打包/合并还会把它算进去（等于重复报销）。
+    """
+
+    def test_refunding_a_secondary_item_keeps_the_primary_items_invoice(self):
+        """从**非主条目**退货，只摘掉那一条的关联 —— 主条目没退货，票该留着。
+
+        旧行为是整张删掉：b 退了，连 a 的票和归档文件一起没了（文件删了找不回）。
+        """
+        inv = self._invoice(self.a)              # 主条目是 a
+        repo.link_invoice(inv, self.b)           # 同一张票也挂在 b 上
+        self.assertTrue(repo.invoices_of_item(self.b))
+
+        repo.set_refund(self.b, True, 9.24)      # 从**非主条目** b 退货
+
+        self.assertEqual(repo.invoices_of_item(self.b), [], 'b 退货了，摘掉它的关联')
+        self.assertTrue(repo.invoices_of_item(self.a), 'a 没退货，票不该消失')
+        self.assertIsNotNone(repo.get_invoice(inv), '发票记录不该被删')
+
+    def test_deleting_the_invoice_resets_every_linked_item_status(self):
+        inv = self._invoice(self.a)
+        repo.link_invoice(inv, self.b)
+        for iid in (self.a, self.b):
+            self.assertEqual(repo.get_item(iid)['invoice_status'],
+                             config.INV_RECEIVED)
+
+        repo.delete_invoice(inv)
+
+        for iid in (self.a, self.b):
+            self.assertEqual(repo.get_item(iid)['invoice_status'],
+                             config.INV_NONE, '条目 %s 的发票状态没跟着复位' % iid)
+
+    def test_deleting_one_of_two_invoices_keeps_the_item_marked(self):
+        """还有别的票挂着，就不能把状态复位掉。"""
+        first = self._invoice(self.a)
+        self._invoice(self.a, amount=5.0, name='第二张.pdf')
+        repo.delete_invoice(first)
+        self.assertEqual(repo.get_item(self.a)['invoice_status'],
+                         config.INV_RECEIVED)
+
+
+class TestRefundKeepsTheSharedInvoice(TestInvoiceItems):
+    """退货只摘掉**本条目**与票的关联 —— 别把别人那条共享的票整张删掉。
+
+    踩过的坑（探针实测）：票挂在 A+B 上，对 A 点退货 → 票和归档文件一起被删，
+    B 明明没退货，票却凭空消失，文件也找不回来。
+    """
+
+    def test_the_other_item_keeps_the_invoice(self):
+        inv = self._invoice(self.a)
+        repo.link_invoice(inv, self.b)
+
+        repo.set_refund(self.a, True, 22)
+
+        self.assertEqual(repo.invoices_of_item(self.a), [])
+        self.assertTrue(repo.invoices_of_item(self.b), 'B 没退货，票不该消失')
+        self.assertIsNotNone(repo.get_invoice(inv), '发票记录不该被删掉')
+
+    def test_the_other_item_stays_marked_as_received(self):
+        inv = self._invoice(self.a)
+        repo.link_invoice(inv, self.b)
+        repo.set_refund(self.a, True, 22)
+        self.assertEqual(repo.get_item(self.b)['invoice_status'], config.INV_RECEIVED)
+
+    def test_a_sole_invoice_is_still_deleted(self):
+        """只有这一条挂着它时，退货仍然把票删干净（别留下无主票）。"""
+        inv = self._invoice(self.a)
+        repo.set_refund(self.a, True, 22)
+        self.assertIsNone(repo.get_invoice(inv))
+        self.assertEqual(repo.invoices_of_item(self.a), [])
+
+
+class TestDeletingAnItemCleansUp(TestInvoiceItems):
+    """删条目时，**只属于它的发票要连文件一起删**；共用的票不能受连累。
+
+    以前只 `DELETE FROM items`：库里的 invoices 靠级联没了，
+    但 data/invoices/ 下的 PDF 永远留着 —— 占空间、又查不出属于谁。
+    更糟的是主条目被删时，外键会把**整张共用票**级联删掉。
+    """
+
+    def _real_invoice(self, item_id, name):
+        from app import config
+        rel = 'invoices/%s' % name
+        p = config.DATA_DIR / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b'%PDF-1.4 test')
+        inv = repo.add_invoice(item_id, self.rid, name, name, rel, 13, amount=1.0)
+        return inv, p
+
+    def test_its_own_invoice_and_file_are_gone(self):
+        inv, path = self._real_invoice(self.a, 'solo.pdf')
+        self.assertTrue(path.exists())
+        repo.delete_item(self.a)
+        self.assertIsNone(repo.get_invoice(inv))
+        self.assertFalse(path.exists(), '文件也要删')
+
+    def test_a_shared_invoice_survives(self):
+        inv, path = self._real_invoice(self.a, 'shared.pdf')
+        repo.link_invoice(inv, self.b)
+        repo.delete_item(self.a)          # 主条目被删
+        self.assertIsNotNone(repo.get_invoice(inv), '票还挂在 b 上，不能跟着没')
+        self.assertTrue(path.exists(), '文件也不能删')
+        self.assertEqual([x['id'] for x in repo.items_of_invoice(inv)], [self.b])
+
+    def test_the_shared_invoice_repoints_its_main_item(self):
+        """主条目改指到剩下那条 —— 否则下次删 b 时又把整张票带走。"""
+        inv, _ = self._real_invoice(self.a, 'shared2.pdf')
+        repo.link_invoice(inv, self.b)
+        repo.delete_item(self.a)
+        self.assertEqual(repo.get_invoice(inv)['item_id'], self.b)

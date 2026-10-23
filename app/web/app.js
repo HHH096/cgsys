@@ -11,6 +11,10 @@ const state = {
   invoiceCounts: {},
   pendingOrder: [],
   pendingInvoice: [],
+  shoppingList: [],       // 待购清单：待下单 + 未退货 + 没人垫付
+  shopError: '',          // 待购清单加载失败的提示（别把它显示成「没有要买的」）
+  payers: [],             // 垫付结算：谁先掏了多少钱
+  payerError: '',
   split: null,
   splitIds: { low: [], high: [] },
   me: null,
@@ -35,10 +39,68 @@ const MODE = document.documentElement.className === 'mode-purchase'
   ? 'purchase' : 'member';
 const IS_PURCHASE = MODE === 'purchase';
 
+const API_TIMEOUT_MS = 20000;      // 20 秒没响应就当断了
+
+/* ---------------------------------------------------------------- 会话过期
+
+ * 登录凭证放在服务进程内存里（见 settings.py），**服务一重启就全失效**。
+ * 不处理的话：所有保存都返回 401、界面还显示着旧数据 ——
+ * 人以为存上了，其实什么都没写进去。这是最难发现的一类问题。
+ */
+const AUTH_PATHS = ['/api/purchase/login', '/api/purchase/status',
+                    '/api/purchase/password', '/api/member/login',
+                    '/api/member/status'];
+
+function isAuthPath(path) {
+  return AUTH_PATHS.indexOf(String(path || '').split('?')[0]) >= 0;
+}
+
+/** 登录失效：停轮询、把门弹回来、说清为什么。一屏十几个请求只处理一次。 */
+function handleSessionExpired() {
+  if (handleSessionExpired._done) return;
+  handleSessionExpired._done = true;
+  clearInterval(startAutoRefresh._t);       // 别继续刷 401
+  state.busy = false;
+  if (IS_PURCHASE) {
+    showLoginGate();
+    $('loginHint').textContent = '登录已过期（服务重启过），请重新输入密码。';
+  } else {
+    showMemberGate();
+    $('memberHint').textContent = '口令已过期（服务重启过），请重新输入组员口令。';
+  }
+  toast('登录已过期，请重新登录', true);
+  // 给它一个窗口期：这期间的并发请求不再重复弹
+  setTimeout(() => { handleSessionExpired._done = false; }, 5000);
+}
+
+/** 重新登录成功后要能再次触发（否则这次会话再过期就不弹门了）。 */
+function resetSessionExpiredFlag() { handleSessionExpired._done = false; }
+
 async function api(path, opts = {}) {
-  const res = await fetch(path, Object.assign(
-    { headers: { 'Content-Type': 'application/json' } }, opts));
+  // 断网/服务挂掉时 fetch 会一直挂着不返回 —— 没有超时的话 state.busy 永远不复位，
+  // 自动刷新也停在第一条，整页看着像死了。
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), API_TIMEOUT_MS);
+  let res;
+  try {
+    res = await fetch(path, Object.assign(
+      { headers: { 'Content-Type': 'application/json' } }, opts,
+      { signal: ctrl.signal }));
+  } catch (e) {
+    if (e && e.name === 'AbortError') {
+      const err = new Error('请求超时（' + (API_TIMEOUT_MS / 1000)
+        + ' 秒没响应）—— 网络断了或服务没在跑');
+      err.status = 0;
+      throw err;
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
   if (!res.ok) {
+    // 401 = 会话失效（服务重启会把内存里的登录凭证清掉）。
+    // 登录类接口自己的 401 是「密码错」，不该当成会话过期。
+    if (res.status === 401 && !isAuthPath(path)) handleSessionExpired();
     let detail = res.status + ' ' + res.statusText;
     try { const j = await res.json(); if (j.detail) detail = j.detail; } catch (e) { /* 非 JSON */ }
     const err = new Error(detail);
@@ -129,9 +191,30 @@ async function loadRounds() {
   await loadRound(sel.value);
 }
 
+/** 切轮次/自动刷新会并发调 loadRound；用序号判断「这份结果是不是已经过期」。 */
+let _roundSeq = 0;
+
 async function loadRound(id) {
   if (!id) { state.round = null; state.items = []; renderAll(); return; }
-  const d = await api('/api/rounds/' + id);
+  const seq = ++_roundSeq;
+  let d;
+  try {
+    d = await api('/api/rounds/' + id);
+  } catch (e) {
+    // 切轮次失败：下拉框已经变了，但表格还是**上一轮**的数据。
+    // 必须把下拉拨回去 —— 否则人以为在看新轮次，保存/改状态的却是上一轮的行。
+    if (seq === _roundSeq) {
+      const sel = $('roundSelect');
+      sel.value = state.round ? String(state.round.id) : '';
+      toast('切轮次失败：' + (e.message || '网络问题')
+            + '（已留在原来那一轮）', true);
+    }
+    return;                    // 不往上抛：调用方多半只是「保存后刷新」
+  }
+  // 期间又切了轮次、或者自动刷新又发了一次 → 这份结果已经过期，直接丢掉。
+  // 不丢的话，慢请求后到会把新轮次的数据覆盖掉：下拉框是 A 轮、表格是 B 轮，
+  // 人照着改就会改错行。
+  if (seq !== _roundSeq) return;
   state.round = d.round;
   state.items = d.items;
   state.split = d.split;
@@ -141,7 +224,12 @@ async function loadRound(id) {
   state.pendingInvoice = d.pending_invoice || [];
   state.splitIds = d.split_ids || { low: [], high: [] };
   localStorage.setItem('round_id', String(id));
-  if (IS_PURCHASE) await loadBlock();     // 总表行块是采购专用的
+  if (IS_PURCHASE) {
+    // 这三个是采购专用的附加数据，**并行**发。
+    // 以前是三个串行 await：局域网无感，但走隧道时每个 RTT 150-300ms，
+    // 一次切轮次/一次自动刷新就白等 0.5-1 秒。
+    await Promise.all([loadBlock(), loadShoppingList(), loadPayerSummary()]);
+  }
   renderAll();
   if (!IS_PURCHASE) refreshMemberProgress();
 }
@@ -170,6 +258,7 @@ function renderAll() {
   renderSplit();
   renderProgress();
   renderMerge();
+  fillMergeRounds();
   renderBlock();
   renderItems();
   updateCalc();
@@ -298,7 +387,12 @@ async function loadMailConfig() {
   $('m_keywords').value = (c.keywords || []).join(',');
   $('m_interval').value = c.auto_interval || 0;
   $('m_unseen').checked = !!c.unseen_only;
+  $('m_scanread').checked = !!c.scan_read;
   $('m_any').checked = !!c.any_attachment;
+  // 没存过就往「开」上摆：淘宝/阿里的发票只在正文链接里，关掉就等于收不到
+  $('m_linkdl').checked = c.link_download === undefined ? true : !!c.link_download;
+  // 同理，没存过默认开：只挂金额唯一对得上的那种，挂错风险很低
+  $('m_autoattach').checked = c.auto_attach === undefined ? true : !!c.auto_attach;
   $('m_password').value = '';
   $('m_password').placeholder = c.has_password ? '已保存（要改就重新填）' : '不是登录密码';
   const sel = $('m_preset');
@@ -318,7 +412,10 @@ async function saveMailConfig() {
     days: Number($('m_days').value) || 0,
     max_mails: Number($('m_max').value) || 200,
     unseen_only: $('m_unseen').checked,
+    scan_read: $('m_scanread').checked,
     any_attachment: $('m_any').checked,
+    link_download: $('m_linkdl').checked,
+    auto_attach: $('m_autoattach').checked,
     auto_interval: Number($('m_interval').value) || 0,
     keywords: $('m_keywords').value.split(/[,，]/).map((s) => s.trim()).filter(Boolean),
   };
@@ -406,9 +503,52 @@ function mailCard(r) {
 
   if (r.status === 'attached') {
     const done = document.createElement('div');
-    done.className = 'meta';
-    done.textContent = '已挂到条目 #' + (r.item_id || '?') + '（归档后已离开待归档）';
+    if (r.auto_attached) {
+      // 系统自己挂的：人没点过它，得让他一眼看出来，并且当场能改。
+      // 一票多条时要显示「挂到了哪几条」——只报主条目会让人以为挂错了。
+      const ids = (r.item_ids && r.item_ids.length)
+        ? r.item_ids.join('、') : String(r.item_id || '?');
+      const n = r.item_count || 1;
+      done.className = 'meta autonote';
+      done.textContent = '⚙ 系统自动挂到'
+        + (n > 1 ? (' ' + n + ' 条（#' + ids + '）') : ('条目 #' + ids))
+        + ' —— 挂错了就点「改挂」';
+    } else {
+      done.className = 'meta';
+      const ids = (r.item_ids && r.item_ids.length)
+        ? r.item_ids.join('、') : String(r.item_id || '?');
+      done.textContent = '已挂到条目 #' + ids + '（归档后已离开待归档）';
+    }
     card.appendChild(done);
+    // 挂完之后待归档那份文件就删了（避免同一张留两份），
+    // 所以这里要指向**归档后**的那张票，不能再用 /api/mail/pending/.../file。
+    if (r.invoice_id) {
+      const row = document.createElement('div');
+      row.className = 'row';
+      const look = document.createElement('button');
+      look.type = 'button';
+      look.className = 'mini';
+      look.textContent = '看发票';
+      look.onclick = () => viewInvoiceFile(r.invoice_id, r.stored_name);
+      const save = document.createElement('button');
+      save.type = 'button';
+      save.className = 'mini';
+      save.textContent = '下载';
+      save.onclick = () => {
+        window.location = '/api/invoices/' + r.invoice_id + '/file?download=1';
+      };
+      row.append(look, save);
+      if (r.auto_attached) {
+        // 自动挂错了要能当场纠正 —— 不用去条目表里找那一行
+        const fix = document.createElement('button');
+        fix.type = 'button';
+        fix.className = 'mini';
+        fix.textContent = '改挂';
+        fix.onclick = () => reassignInvoice({ id: r.invoice_id, stored_name: r.stored_name });
+        row.appendChild(fix);
+      }
+      card.appendChild(row);
+    }
     return card;
   }
 
@@ -428,6 +568,18 @@ function mailCard(r) {
 
   const row2 = document.createElement('div');
   row2.className = 'row';
+  // 挂之前得先看清票面 —— 不然不知道这一张该挂到哪一笔上。
+  // 就地弹层看，不开新标签页（那个关起来太别扭）。
+  const look = document.createElement('button');
+  look.type = 'button';
+  look.className = 'mini';
+  look.textContent = '看发票';
+  look.onclick = () => viewPendingFile(r.id, r.stored_name);
+  const save = document.createElement('button');
+  save.type = 'button';
+  save.className = 'mini';
+  save.textContent = '下载';
+  save.onclick = () => { window.location = '/api/mail/pending/' + r.id + '/file?download=1'; };
   const sel = document.createElement('select');
   sel.innerHTML = '<option value="">— 手工选一个条目 —</option>';
   (state.items || []).forEach((it) => {
@@ -446,7 +598,7 @@ function mailCard(r) {
   del.className = 'mini danger';
   del.textContent = '撤下';
   del.onclick = () => ignoreMail(r.id);
-  row2.append(sel, go, del);
+  row2.append(look, save, sel, go, del);
   card.appendChild(row2);
   return card;
 }
@@ -472,6 +624,217 @@ async function ignoreMail(mailId) {
 }
 
 /* ---------------------------------------------------------------- 回填车队总表 */
+
+/* ---------------------------------------------------------------- 待购清单
+
+ * 「还要买」的那些条目：待下单、没退货、也没人垫付。
+ * 痛点原本是「复制到手机上再打开很繁琐」，所以这里每条给一个干净链接，
+ * 点一下就在电脑上直接开商品页下单。
+ */
+async function loadShoppingList() {
+  const rid = state.round && state.round.id;
+  if (!rid) { state.shoppingList = []; renderShoppingList(); return; }
+  try {
+    const rows = await api('/api/rounds/' + rid + '/shopping-list');
+    if (!state.round || state.round.id !== rid) return;   // 期间切走了就丢弃
+    state.shoppingList = rows || [];
+    state.shopError = '';
+  } catch (e) {
+    // 加载失败**不能**显示成「没有要买的了」—— 那会让人以为活干完了。
+    if (state.round && state.round.id === rid) {
+      state.shoppingList = [];
+      state.shopError = e.message || '加载失败';
+    }
+  }
+  renderShoppingList();
+}
+
+function renderShoppingList() {
+  const box = $('shopList');
+  const rows = state.shoppingList || [];
+  box.innerHTML = '';
+  if (state.shopError) {
+    // 加载失败 ≠ 没有要买的。写成「没有」会让人以为活干完了。
+    $('shopHint').textContent = '';
+    $('shopOpenAll').disabled = true;
+    $('shopCopy').disabled = true;
+    const p = document.createElement('p');
+    p.className = 'muted small';
+    p.textContent = '待购清单加载失败：' + state.shopError + '（这不代表没有要买的）';
+    box.appendChild(p);
+    return;
+  }
+  const withLink = rows.filter((r) => r.link).length;
+
+  if (!rows.length) {
+    $('shopHint').textContent = state.round ? '没有要买的了' : '';
+    box.innerHTML = '<p class="muted small">这一轮待下单的条目都处理完了'
+      + '（已下单的、退货的、别人垫付过的都不在这儿）。</p>';
+    $('shopOpenAll').disabled = true;
+    $('shopCopy').disabled = true;
+    return;
+  }
+
+  $('shopHint').textContent = rows.length + ' 条待买'
+    + (withLink < rows.length ? ('（' + (rows.length - withLink) + ' 条没填链接）') : '');
+  $('shopOpenAll').disabled = withLink === 0;
+  $('shopCopy').disabled = false;
+
+  rows.forEach((r, i) => {
+    const card = document.createElement('div');
+    card.className = 'shopcard';
+
+    const head = document.createElement('div');
+    head.className = 'subj';
+    head.textContent = (i + 1) + '. ' + (r.name || '(没写名称)');
+    card.appendChild(head);
+
+    const meta = document.createElement('div');
+    meta.className = 'meta';
+    // 规格按**原文**显示：淘宝的规格选项名不一定一样，这是下单唯一的依据
+    const bits = [];
+    if (r.spec) bits.push('规格：' + r.spec);
+    bits.push('数量：' + fmt(r.qty) + (r.unit || ''));
+    if (r.price !== null && r.price !== undefined) bits.push('单价：¥' + fmt(r.price));
+    if (r.applicant) bits.push('申购：' + r.applicant);
+    meta.textContent = bits.join(' · ');
+    card.appendChild(meta);
+
+    if (r.note) {
+      const note = document.createElement('div');
+      note.className = 'meta';
+      note.textContent = '备注：' + r.note;
+      card.appendChild(note);
+    }
+
+    const row = document.createElement('div');
+    row.className = 'row';
+    if (r.link) {
+      // 用**真链接**而不是 button+window.open：
+      // 浏览器一次点击只放行一个弹窗，批量打开必然只开一个；
+      // 真链接可以用 Ctrl+点击 / 鼠标中键一次开好几个，浏览器不拦。
+      const go = document.createElement('a');
+      go.className = 'mini';
+      go.href = r.link;
+      go.target = '_blank';
+      go.rel = 'noopener noreferrer';
+      go.textContent = '打开商品页';
+      go.title = '按住 Ctrl 点（或鼠标中键）可一次开好几个';
+      row.appendChild(go);
+    } else {
+      const none = document.createElement('span');
+      none.className = 'muted small';
+      none.textContent = '这条没填商品链接，只能按名称去淘宝搜';
+      row.appendChild(none);
+    }
+    card.appendChild(row);
+    box.appendChild(card);
+  });
+}
+
+/** 一次打开所有有链接的条目 —— 浏览器通常只放行用户点的那一个，会拦截后面的。 */
+/** 全部打开：浏览器一次点击只允许开一个窗口，所以这里最多开第一个。
+ *
+ * 实测（Chrome/Edge/Firefox 都是）：一个用户手势只放行一个 window.open，
+ * 其余会被静默拦掉——所以「全部打开」注定只开一个，不是坏了。
+ * 想真正批量，用**真链接**按住 Ctrl 点，或者鼠标中键逐个点。
+ */
+function openAllShop() {
+  const links = (state.shoppingList || []).map((r) => r.link).filter(Boolean);
+  if (!links.length) { toast('待购清单里没有可打开的链接', true); return; }
+  window.open(links[0], '_blank', 'noopener');
+  if (links.length > 1) {
+    toast('浏览器一次只放行一个窗口，已打开第 1 条；'
+      + '其余 ' + (links.length - 1) + ' 条请按住 Ctrl 点「打开商品页」（或用鼠标中键）');
+  } else {
+    toast('已打开商品页');
+  }
+}
+
+/** 把清单复制成文本（贴到微信/备忘里，手机上照着买）。 */
+async function copyShopList() {
+  const rows = state.shoppingList || [];
+  const lines = rows.map((r, i) => {
+    const bits = [(i + 1) + '. ' + (r.name || '')];
+    if (r.spec) bits.push('规格 ' + r.spec);
+    bits.push('×' + fmt(r.qty) + (r.unit || ''));
+    if (r.link) bits.push(r.link);
+    return bits.join('  ');
+  });
+  try {
+    await navigator.clipboard.writeText(lines.join('\n'));
+    toast('已复制 ' + rows.length + ' 条，可以发到手机上');
+  } catch (e) {
+    toast('复制失败，请手动选择文本', true);
+  }
+}
+
+/* ---------------------------------------------------------------- 垫付结算
+
+ * `payer` 一直只标在行上（表格里一个小标签），从来没汇总过。
+ * 可钱的事总要有人问一句「这轮谁垫了多少、该给谁转账」。
+ */
+async function loadPayerSummary() {
+  const rid = state.round && state.round.id;
+  if (!rid) { state.payers = []; renderPayers(); return; }
+  try {
+    const rows = await api('/api/rounds/' + rid + '/payers');
+    if (!state.round || state.round.id !== rid) return;   // 期间切走了就丢弃
+    state.payers = rows || [];
+    state.payerError = '';
+  } catch (e) {
+    // 同样：加载失败不能显示成「这轮没人垫付」
+    if (state.round && state.round.id === rid) {
+      state.payers = [];
+      state.payerError = e.message || '加载失败';
+    }
+  }
+  renderPayers();
+}
+
+function renderPayers() {
+  const box = $('payerList');
+  const rows = state.payers || [];
+  box.innerHTML = '';
+  if (state.payerError) {
+    $('payerHint').textContent = '';
+    const p = document.createElement('p');
+    p.className = 'muted small';
+    p.textContent = '垫付结算加载失败：' + state.payerError + '（这不代表没人垫钱）';
+    box.appendChild(p);
+    return;
+  }
+  if (!rows.length) {
+    $('payerHint').textContent = state.round ? '这轮没人垫付' : '';
+    box.innerHTML = '<p class="muted small">这一轮没有人自己先掏钱。</p>';
+    return;
+  }
+  const total = rows.reduce((s, r) => s + (r.amount || 0), 0);
+  $('payerHint').textContent = rows.length + ' 人 · 合计 ¥'
+    + fmt(Math.round(total * 100) / 100);
+
+  const table = document.createElement('table');
+  table.className = 'payertable';
+  const head = document.createElement('tr');
+  ['垫付人', '笔数', '金额'].forEach((h) => {
+    const th = document.createElement('th');
+    th.textContent = h;
+    head.appendChild(th);
+  });
+  table.appendChild(head);
+  rows.forEach((r) => {
+    const tr = document.createElement('tr');
+    const who = document.createElement('td');
+    who.textContent = r.payer;
+    const n = document.createElement('td');
+    n.textContent = r.count;
+    const amt = document.createElement('td');
+    amt.textContent = '¥' + fmt(r.amount);
+    tr.append(who, n, amt);
+    table.appendChild(tr);
+  });
+  box.appendChild(table);
+}
 
 async function loadBlock() {
   const rid = state.round && state.round.id;
@@ -522,6 +885,11 @@ function blockCopy() {
 
 function blockXlsx() {
   if (!state.round) return;
+  const rec = state.block && state.block.reconcile;
+  if (!rec || !rec.count) {
+    toast('这一轮还没有可导出的行块', true);
+    return;
+  }
   window.location = '/api/rounds/' + state.round.id + '/block.xlsx';
 }
 
@@ -537,14 +905,121 @@ function renderMerge() {
   $('mergePdf').disabled = !state.round || n === 0;
 }
 
-function mergePdf() {
+async function mergePdf() {
   if (!state.round || !state.invoices.length) return;
   const q = new URLSearchParams({
     per_page: $('mergePerPage').value,
     back: $('mergeBack').checked ? '1' : '0',
     frame: $('mergeFrame').checked ? '1' : '0',
   });
-  window.open('/api/rounds/' + state.round.id + '/merged.pdf?' + q.toString(), '_blank');
+  const btn = $('mergePdf');
+  btn.disabled = true;
+  try {
+    // 先合出来**给人看一眼**，而不是直接下载 ——
+    // 页数对不对、背面配没配上，当场就能发现；错了再调一次，别白印一叠纸。
+    const res = await api('/api/rounds/' + state.round.id + '/merged.pdf?' + q.toString());
+    const blob = await res.blob();
+    const per = parseInt($('mergePerPage').value, 10) || 2;
+    const n = state.invoices.length;
+    const groups = Math.ceil(n / per);
+    showMergePreview(blob, '本轮合并结果',
+      n + ' 张发票 · 共 ' + (withBackPages(groups)) + ' 页');
+    toast('已生成，先看看对不对');
+  } catch (e) {
+    toast(e.message || '合并失败', true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+/** 预览里那份 PDF 一共几页（正+背）。 */
+function withBackPages(groups) {
+  return $('mergeBack').checked ? groups * 2 : groups;
+}
+
+/* ------------------------------------------------- 合并结果预览
+
+ * 合成完直接把 PDF 嵌在卡片里看，不用另开窗口、也不会先存进「下载」文件夹。
+ * 用 blob URL 喂 iframe，浏览器自带的阅读器就能翻页、缩放。
+ */
+let _mergePreviewUrl = null;
+
+function showMergePreview(blob, title, hint) {
+  closeMergePreview();                     // 先放掉上一份，不然每合一次漏几 MB
+  _mergePreviewUrl = URL.createObjectURL(blob);
+  $('mergePreviewFrame').src = _mergePreviewUrl;
+  $('mergePreviewTitle').textContent = title || '合并结果预览';
+  $('mergePreviewHint').textContent = hint || '';
+  const box = $('mergePreviewBox');
+  box.hidden = false;
+  if (box.scrollIntoView) box.scrollIntoView({ block: 'nearest' });
+}
+
+function closeMergePreview() {
+  if (_mergePreviewUrl) {
+    URL.revokeObjectURL(_mergePreviewUrl);   // 不 revoke 就占着内存
+    _mergePreviewUrl = null;
+  }
+  const f = $('mergePreviewFrame');
+  if (f) f.removeAttribute('src');
+  const box = $('mergePreviewBox');
+  if (box) box.hidden = true;
+}
+
+function downloadMergePreview() {
+  if (!_mergePreviewUrl) return;
+  const a = document.createElement('a');
+  a.href = _mergePreviewUrl;
+  a.download = '发票合并_' + new Date().toISOString().slice(0, 10) + '.pdf';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
+
+/** 让预览里的阅读器去打印。 */
+function printMergePreview() {
+  const f = $('mergePreviewFrame');
+  if (!f || !_mergePreviewUrl) return;
+  // 让 iframe 里的阅读器去打印：打出来的就是屏幕上看到的这一份。
+  try {
+    f.contentWindow.focus();
+    f.contentWindow.print();
+  } catch (e) {
+    toast('这个浏览器不让直接打印，先点「下载」再用阅读器打印', true);
+  }
+}
+
+/* ------------------------------------------------- 发票预览弹层
+
+ * 点「看发票」就地弹出来看 —— 不用新开标签页。
+ * 新标签页那个做法**关起来太别扭**（得去点浏览器那个关闭，或者一路退回去），
+ * 这里是页面里的弹层：有关闭按钮，按 ESC 或点背景空白也能关。
+ */
+function openFileViewer(url, title, hint, downloadUrl) {
+  $('fileViewerTitle').textContent = title || '发票';
+  $('fileViewerHint').textContent = hint || '';
+  $('fileViewerFrame').src = url;
+  const dl = $('fileViewerDownload');
+  dl.href = downloadUrl || (url + (url.indexOf('?') >= 0 ? '&' : '?') + 'download=1');
+  $('fileViewer').hidden = false;
+}
+
+function closeFileViewer() {
+  if ($('fileViewer').hidden) return;
+  $('fileViewer').hidden = true;
+  $('fileViewerFrame').removeAttribute('src');   // 停掉 PDF 阅读器
+}
+
+/** 待归档的那张票：还没进 invoices 表，走 /api/mail/pending/{id}/file。 */
+function viewPendingFile(mid, name) {
+  openFileViewer('/api/mail/pending/' + mid + '/file',
+                 name || '发票', '还没归档的发票');
+}
+
+/** 已经归档的票（含挂完之后的记录），走 /api/invoices/{id}/file。 */
+function viewInvoiceFile(invId, name) {
+  openFileViewer('/api/invoices/' + invId + '/file',
+                 name || '发票', '已归档的发票');
 }
 
 /** 把本轮所有发票打包成 zip 下载（一票多条时那张票只出现一次）。
@@ -558,6 +1033,85 @@ function invoiceZip() {
     return;
   }
   window.location = '/api/rounds/' + state.round.id + '/invoices.zip';
+}
+
+/** 只更新「从本机上传合并」那行的提示与按钮可用性。 */
+function renderMergeFiles() {
+  const n = (($('mergeFiles').files) || []).length;
+  $('mergeFileHint').textContent = n ? ('已选 ' + n + ' 个文件') : '';
+  $('mergeUpload').disabled = n === 0;
+}
+
+/** 把轮次下拉填成多选列表。默认**选中当前这一轮**（最常见的用法），其余留给人自己勾。
+
+ * 返工重开的票常常对应上个月那批，所以这里不写死当前轮，让人能多选。
+ * 换轮次（loadRound）时**不重置**已勾选，免得人刚勾好又被清掉。
+ */
+function fillMergeRounds() {
+  const box = $('mergeRounds');
+  if (!box) return;
+  const had = Array.from(box.querySelectorAll('.pickitem.on')).map((b) => b.dataset.id);
+  const keep = had.length ? had : (state.round ? [String(state.round.id)] : []);
+  box.innerHTML = '';
+  state.rounds.forEach((r) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'pickitem' + (keep.indexOf(String(r.id)) >= 0 ? ' on' : '');
+    b.dataset.id = String(r.id);
+    b.textContent = r.name + (r.status === 'open' ? '' : '（已锁定）');
+    b.onclick = () => { b.classList.toggle('on'); renderMergeRounds(); };
+    box.appendChild(b);
+  });
+  renderMergeRounds();
+}
+
+function renderMergeRounds() {
+  const box = $('mergeRounds');
+  if (!box) return;
+  const n = box.querySelectorAll('.pickitem.on').length;
+  $('mergeRoundsHint').textContent = n
+    ? ('已选 ' + n + ' 轮')
+    : '不选则背面不配（留空）';
+}
+
+function mergeRoundIds() {
+  const box = $('mergeRounds');
+  return Array.from(box ? box.querySelectorAll('.pickitem.on') : [])
+    .map((b) => b.dataset.id);
+}
+
+/** 把本机选的几张票直接合成一份下载 —— 不走本轮的发票账（返工重开的票用这个）。
+
+ * 复用上面的「每页几张 / 生成背面 / 背面外框」三项设置；
+ * 把**勾选的那几轮**的 id 一并发给后端，拿它们的条目去自动配背面信息。
+ */
+async function mergeUpload() {
+  const files = Array.from(($('mergeFiles').files) || []);
+  if (!files.length) { toast('先选几张发票文件（PDF 或图片）', true); return; }
+  const fd = new FormData();
+  files.forEach((f) => fd.append('files', f, f.name));
+  fd.append('per_page', $('mergePerPage').value);
+  fd.append('back', $('mergeBack').checked ? '1' : '0');
+  fd.append('frame', $('mergeFrame').checked ? '1' : '0');
+  const rids = mergeRoundIds();
+  if (rids.length) fd.append('round_ids', rids.join(','));
+  const btn = $('mergeUpload');
+  btn.disabled = true;
+  try {
+    // headers:{} 覆盖 api() 默认的 JSON 头，交给浏览器自己设 multipart 边界
+    const res = await api('/api/merge/custom.pdf',
+      { method: 'POST', body: fd, headers: {} });
+    const blob = await res.blob();
+    const per = parseInt($('mergePerPage').value, 10) || 2;
+    const groups = Math.ceil(files.length / per);
+    showMergePreview(blob, '本机上传合并结果',
+      files.length + ' 张 · 共 ' + withBackPages(groups) + ' 页 · 这批不入账');
+    toast('已合并 ' + files.length + ' 张，先看看对不对');
+  } catch (e) {
+    toast(e.message || '合并失败', true);
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 function visibleItems() {
@@ -746,14 +1300,22 @@ function renderItems() {
       // 链接太长会把整张表撑爆（淘宝分享的链接能有 100 多字符），
       // 所以只显示域名短标签，完整地址放悬浮提示，点开是新标签页。
       if (i === 11 && it.url) {
-        const a = document.createElement('a');
-        a.href = it.url;
-        a.target = '_blank';
-        a.rel = 'noopener noreferrer';
-        a.textContent = shortUrl(it.url);
-        a.title = it.url;
-        td.textContent = '';
-        td.appendChild(a);
+        // **只给 http(s) 建真链接**：这个字段组员能随便填，
+        // 填成 `javascript:...` 的话，采购一点开就等于在自己电脑上执行脚本。
+        // 不是 http(s) 的（比如有人只填了商家名称）当纯文本显示，一样看得见。
+        const url = String(it.url).trim();
+        if (/^https?:\/\//i.test(url)) {
+          const a = document.createElement('a');
+          a.href = url;
+          a.target = '_blank';
+          a.rel = 'noopener noreferrer';
+          a.textContent = shortUrl(url);
+          a.title = url;
+          td.textContent = '';
+          td.appendChild(a);
+        } else {
+          td.textContent = url;
+        }
       }
       tr.appendChild(td);
     });
@@ -1026,6 +1588,73 @@ async function parseShare() {
   }
 }
 
+/* ------------------------------------------------- 填单时「上次买过什么」
+
+ * 组员每轮都在重复填同一个器件，规格和单价每次重敲又慢又容易错。
+ * 打到物料名称里就顺手查一下历史，点一下把规格/单价/单位/链接带出来。
+ */
+let _historyTimer = null;
+
+function loadNameHistory() {
+  const name = ($('f_name').value || '').trim();
+  clearTimeout(_historyTimer);
+  if (!name) { renderNameHistory([]); return; }
+  // 打字过程中不要每敲一下就发一次请求
+  _historyTimer = setTimeout(async () => {
+    try {
+      const rows = await api('/api/items/history?name=' + encodeURIComponent(name));
+      // 期间又改了名字就丢掉这次结果
+      if (($('f_name').value || '').trim() !== name) return;
+      renderNameHistory(rows || []);
+    } catch (e) {
+      renderNameHistory([]);
+    }
+  }, 400);
+}
+
+function renderNameHistory(rows) {
+  const box = $('nameHistory');
+  if (!box) return;
+  box.innerHTML = '';
+  if (!rows.length) { box.hidden = true; return; }
+  const head = document.createElement('div');
+  head.className = 'muted small';
+  head.textContent = '「' + ($('f_name').value || '').trim() + '」以前买过 —— 点一下带出规格和价格：';
+  box.appendChild(head);
+  rows.forEach((r) => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'sugg';
+    const bits = [];
+    if (r.spec) bits.push('规格 ' + r.spec);
+    if (r.price !== null && r.price !== undefined) bits.push('¥' + fmt(r.price));
+    if (r.unit) bits.push('每' + r.unit);
+    if (r.round_name) bits.push('（' + r.round_name + '）');
+    btn.textContent = bits.length ? bits.join(' · ') : '(没记规格)';
+    btn.title = '用这次的规格和价格';
+    btn.onclick = () => applyHistory(r);
+    box.appendChild(btn);
+  });
+  box.hidden = false;
+}
+
+/** 把历史里那条的规格/单价/单位/链接填进表单（**不覆盖已经填了的内容**更安全）。 */
+function applyHistory(r) {
+  if (r.spec) $('f_spec').value = r.spec;
+  if (r.price !== null && r.price !== undefined) $('f_price').value = r.price;
+  if (r.unit) $('f_unit').value = r.unit;
+  if (r.url) $('f_url').value = r.url;
+  // 用途常常一样，但只在这一栏还空着时补 —— 别把人已经改过的盖掉
+  if (r.purpose && !($('f_purpose').value || '').trim()) $('f_purpose').value = r.purpose;
+  updateCalc();
+  toast('已带出上次的规格与价格');
+}
+
+function clearNameHistory() {
+  clearTimeout(_historyTimer);
+  renderNameHistory([]);
+}
+
 function resetForm() {
   state.editing = null;
   state.editRev = null;
@@ -1039,6 +1668,7 @@ function resetForm() {
   $('shareText').value = '';
   $('parseMsg').textContent = '';
   $('parseMsg').className = 'msg';
+  clearNameHistory();
   updateCalc();
 }
 
@@ -1169,12 +1799,21 @@ async function setStatus(it, field, value, sel) {
  */
 async function setPaid(it, value) {
   try {
+    const body = { paid: value };
+    // 带上「我看到的是哪一版」：两个人同时填同一条时，后到的那次会被拦下，
+    // 而不是默默把前一个人填的数字盖掉（对账会因此错得莫名其妙）。
+    if (it && it.rev !== undefined && it.rev !== null) body.base_rev = it.rev;
     await api('/api/items/' + it.id + '/paid', {
-      method: 'POST', body: JSON.stringify({ paid: value }),
+      method: 'POST', body: JSON.stringify(body),
     });
     await loadRound(state.round.id);
     return true;
   } catch (e) {
+    if (e.status === 409) {
+      toast('这条在你填的时候被别人改过了，已刷新 —— 请对着最新内容再填一次', true);
+      try { await loadRound(state.round.id); } catch (e2) { /* 刷新失败就算了 */ }
+      return false;
+    }
     toast('实付金额没填上：' + e.message, true);
     return false;
   }
@@ -1201,7 +1840,7 @@ async function askPaidForUpload(iid) {
   if (v === null || v === '') return;
   const n = Number(v);
   if (!Number.isFinite(n)) { toast('要填数字才行，稍后在那一行的「填金额」里补', true); return; }
-  if (await setPaid({ id: iid }, n)) toast('实付金额已填上 ¥' + fmt(n));
+  if (await setPaid(it, n)) toast('实付金额已填上 ¥' + fmt(n));
 }
 
 async function uploadInvoiceFile(file) {
@@ -1305,6 +1944,12 @@ async function addMember() {
 
 function exportXlsx() {
   if (!state.round) return;
+  // 没有条目时后端会返回 400 JSON —— window.location 会把人带到一页 JSON 上，
+  // 看着像系统坏了。在这儿先说清楚。
+  if (!(state.items || []).length) {
+    toast('本轮还没有条目，没东西可导出', true);
+    return;
+  }
   window.location = '/api/rounds/' + state.round.id + '/export';
 }
 
@@ -1343,7 +1988,14 @@ async function autoRefresh() {
   if (state.busy || anyPopupOpen()) return;               // 有请求在路上 / 弹窗开着
   if (formDirty()) return;                                // 有人在写，别动页面
   if (!$('loginGate').hidden || !$('memberGate').hidden || !$('nameGate').hidden) return;
-  if (!state.round) return;
+  if (!state.round) {
+    // 首屏某个接口失败过、没拿到轮次：轮询时顺手重试一次入口，
+    // 别让人只能自己按 F5。（门都关着 = 本来已经进系统了，不是没登录）
+    try {
+      if (IS_PURCHASE) await startPurchase(); else await startMember();
+    } catch (e) { /* 还没好就等下一轮 */ }
+    return;
+  }
   const active = document.activeElement;
   // 光标正停在某个输入/下拉上：这一轮先跳过，免得重绘把焦点弄丢
   if (active && ['INPUT', 'SELECT', 'TEXTAREA'].includes(active.tagName)) return;
@@ -1368,9 +2020,11 @@ function showLoginGate() {
   $('loginGate').hidden = false;
   $('loginTitle').textContent = setting ? '给采购入口设个密码' : '采购人员登录';
   $('loginHint').textContent = setting
-    ? '第一次进来，先设一个密码。只有负责采购的同学需要知道它。'
+    ? '第一次进来，先设一个密码。初始化码写在服务器的 data/setup-code.txt 里（启动日志也打印过），'
+      + 'SSH 登录服务器就能看到 —— 这样别人抢不了你的采购权限。'
     : '组员请用不带 /purchase 的那个地址。忘了密码就删掉 data\\settings.json 重设。';
   $('loginPw2').hidden = !setting;
+  $('loginSetup').hidden = !setting;      // 首次设密码才要初始化码
   $('loginBtn').textContent = setting ? '设置并进入' : '进入采购工作台';
   $('loginPw').focus();
 }
@@ -1384,7 +2038,8 @@ async function doLogin(e) {
     if (setting) {
       if (pw !== $('loginPw2').value) throw new Error('两次输入的密码不一样');
       await api('/api/purchase/password', {
-        method: 'POST', body: JSON.stringify({ new: pw }),
+        method: 'POST',
+        body: JSON.stringify({ new: pw, setup: $('loginSetup').value.trim() }),
       });
     } else {
       await api('/api/purchase/login', {
@@ -1393,7 +2048,9 @@ async function doLogin(e) {
     }
     $('loginPw').value = '';
     $('loginPw2').value = '';
+    $('loginSetup').value = '';
     $('loginGate').hidden = true;
+    resetSessionExpiredFlag();     // 重新登录了，以后再过期还要能弹门
     await loadAllPurchase();
     // 登录门过了接着认名字 —— 跟直接进来（已登录）那条路一个规矩
     ensureMyName();
@@ -1619,6 +2276,7 @@ async function doMemberLogin(e) {
     });
     $('memberPw').value = '';
     $('memberGate').hidden = true;
+    resetSessionExpiredFlag();     // 重新输了口令，以后再过期还要能弹门
     await loadAllMember();
     toast('进来了，把你这个月要买的填上就行');
   } catch (err) {
@@ -1776,15 +2434,22 @@ function askText(msg, fallback) {
 function pickItems(msg, options, selected) {
   return new Promise((resolve) => {
     const bar = $('pickBar');
-    const sel = $('pickList');
+    const box = $('pickList');
     $('pickMsg').textContent = msg;
-    sel.innerHTML = '';
+    box.innerHTML = '';
+    // 用可点的标签而不是 <select multiple>：手机浏览器上原生多选基本没法用
+    // （要长按/Ctrl，很多人根本不知道），点一下选中、再点一下取消最直观。
+    const chosen = new Set((selected || []).map(Number));
     options.forEach((o) => {
-      const opt = document.createElement('option');
-      opt.value = String(o.id);
-      opt.textContent = o.label;
-      opt.selected = (selected || []).indexOf(o.id) >= 0;
-      sel.appendChild(opt);
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'pickitem' + (chosen.has(o.id) ? ' on' : '');
+      b.textContent = o.label;
+      b.onclick = () => {
+        if (chosen.has(o.id)) { chosen.delete(o.id); b.classList.remove('on'); }
+        else { chosen.add(o.id); b.classList.add('on'); }
+      };
+      box.appendChild(b);
     });
     bar.hidden = false;
     const finish = (v) => {
@@ -1793,8 +2458,7 @@ function pickItems(msg, options, selected) {
       $('pickCancel').onclick = null;
       resolve(v);
     };
-    $('pickOk').onclick = () => finish(
-      Array.from(sel.selectedOptions).map((o) => Number(o.value)));
+    $('pickOk').onclick = () => finish(Array.from(chosen));
     $('pickCancel').onclick = () => finish(null);
   });
 }
@@ -1989,6 +2653,8 @@ function bind() {
   $('nameGateAdd').addEventListener('click', openMemberAdmin);
   $('resetForm').addEventListener('click', resetForm);
   $('parseShare').addEventListener('click', parseShare);
+  // 填物料名称时顺手查「上次买过什么」
+  $('f_name').addEventListener('input', loadNameHistory);
   $('newRound').addEventListener('click', newRound);
   $('lockRound').addEventListener('click', lockRound);
   $('addMember').addEventListener('click', addMemberRow);
@@ -1996,11 +2662,37 @@ function bind() {
   $('exportXlsx').addEventListener('click', exportXlsx);
   $('mergePdf').addEventListener('click', mergePdf);
   $('invoicesZip').addEventListener('click', invoiceZip);
+  $('mergeFiles').addEventListener('change', renderMergeFiles);
+  $('mergeUpload').addEventListener('click', mergeUpload);
+  $('mergeRounds').addEventListener('change', renderMergeRounds);
+  $('mergeRoundsAll').addEventListener('click', () => {
+    const box = $('mergeRounds');
+    Array.from(box.querySelectorAll('.pickitem')).forEach((b) => b.classList.add('on'));
+    renderMergeRounds();
+  });
+  $('mergeRoundsNone').addEventListener('click', () => {
+    const box = $('mergeRounds');
+    Array.from(box.querySelectorAll('.pickitem')).forEach((b) => b.classList.remove('on'));
+    renderMergeRounds();
+  });
+  $('mergePreviewClose').addEventListener('click', closeMergePreview);
+  $('mergePreviewDownload').addEventListener('click', downloadMergePreview);
+  $('mergePreviewPrint').addEventListener('click', printMergePreview);
+  // 发票预览弹层：关闭按钮、点背景空白、按 ESC —— 三条路都能关掉
+  $('fileViewerClose').addEventListener('click', closeFileViewer);
+  $('fileViewer').addEventListener('click', (e) => {
+    if (e.target === $('fileViewer')) closeFileViewer();
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') closeFileViewer();
+  });
   ['mergePerPage', 'mergeBack', 'mergeFrame'].forEach((id) => {
     $(id).addEventListener('change', renderMerge);
   });
   $('blockCopy').addEventListener('click', blockCopy);
   $('blockXlsx').addEventListener('click', blockXlsx);
+  $('shopOpenAll').addEventListener('click', openAllShop);
+  $('shopCopy').addEventListener('click', copyShopList);
   $('mailSave').addEventListener('click', saveMailConfig);
   $('mailTest').addEventListener('click', mailTest);
   $('mailFetch').addEventListener('click', mailFetch);
@@ -2047,14 +2739,17 @@ function bind() {
 
 (async function start() {
   bind();
+  // 轮询**先开起来**：首屏任一接口失败时，它是唯一的自愈途径。
+  // 以前放在 try 里面 —— 只要启动时有一个请求报错，就再也不刷新了，
+  // 页面半加载，人只能自己按 F5。
+  startAutoRefresh();
   try {
     if (IS_PURCHASE) {
       await startPurchase();
     } else {
       await startMember();
     }
-    // 进来之后就开始跟服务器对时 —— 多人同时填的时候，
-    // 别人的条目、采购改的状态都靠它自己漂过来
-    startAutoRefresh();
-  } catch (e) { toast('加载失败：' + e.message, true); }
+  } catch (e) {
+    toast('加载失败：' + (e.message || '网络问题') + '　稍后会自动重试', true);
+  }
 })();

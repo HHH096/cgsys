@@ -50,6 +50,19 @@ def supplier_key(item):
     return 'url:' + s if s else 'item:%s' % item.get('id')
 
 
+def _net_total(item):
+    """拆单用的金额：退了就扣掉退回的部分。
+
+    不扣的话，退了一笔 900 之后，同商家再买 300 会被一起算成 1200
+    推进「高于一千」里 —— 那条其实早就不该算数了。
+    """
+    item = item or {}
+    total = to_num(item.get('total')) or 0.0
+    if item.get('refunded'):
+        return max(0.0, total - (to_num(item.get('refund_amount')) or 0.0))
+    return total
+
+
 def split_items(items, threshold=None):
     """把条目分到 (低于一千, 高于一千, 各商家合计)。
 
@@ -67,7 +80,8 @@ def split_items(items, threshold=None):
 
     group_totals = OrderedDict()
     for key, idxs in groups.items():
-        s = r2(sum((to_num(items[i].get('total')) or 0.0) for i in idxs)) or 0.0
+        # 用**净额**累加：退掉的行不该再把同商家的合计推过阈值
+        s = r2(sum(_net_total(items[i]) for i in idxs)) or 0.0
         group_totals[key] = s
         bucket = 'high' if s >= th else 'low'
         for i in idxs:
@@ -159,7 +173,12 @@ def validate(item):
         errors.append('申购人电话 长度不对')
 
     url = (item.get('url') or '').strip()
-    if url.startswith(('http://', 'https://')):
+    # 这个字段组员能随便填、采购会点开 —— 危险协议直接在入口拒掉。
+    # 前端那边也只给 http(s) 建真链接（app.js 渲染「网址链接」列），两边都拦。
+    scheme = url.split(':', 1)[0].strip().lower() if ':' in url else ''
+    if scheme in ('javascript', 'data', 'vbscript', 'file'):
+        errors.append('网址链接 不能是 %s: 开头的（填 http(s) 链接，或直接填商家名称）' % scheme)
+    elif url.startswith(('http://', 'https://')):
         rest = url.split('://', 1)[1]
         if not rest or '.' not in rest.split('/', 1)[0]:
             warnings.append('网址链接 看起来不像有效链接（也可以直接填商家名称）')

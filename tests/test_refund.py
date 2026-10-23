@@ -298,3 +298,50 @@ class TestRefundFrontendWiring(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
+
+
+class TestPayingAfterRefund(unittest.TestCase):
+    """先退货、之后才补实付 —— 退款额要跟着补记。
+
+    不补的话：退货时实付空着，`refund_amount` 落成 0；
+    事后补了实付 100，净额仍算 100，可那 100 明明退回来了，对账会多算一笔。
+    """
+
+    def setUp(self):
+        from app.core import repo
+        from tests.support import TempDataTest
+        self._t = TempDataTest('run')
+        self._t.setUp()
+        self.addCleanup(self._t.doCleanups)
+        self.repo = repo
+        self.mid = repo.add_member('张三', '')
+        self.rid = repo.create_round('九月采购')
+
+    def add(self, paid=None):
+        return self.repo.add_item(self.rid, self.mid, {
+            'name': '电容', 'qty': 1, 'unit': '个', 'price': 100,
+            'purpose': 'x', 'applicant': '张三', 'paid': paid})
+
+    def test_filling_paid_later_books_a_full_refund(self):
+        iid = self.add(paid=None)
+        self.repo.set_refund(iid)
+        self.assertEqual(self.repo.get_item(iid)['refund_amount'] or 0, 0)
+
+        self.repo.update_item(iid, {'paid': 100})
+        self.repo.bump_refund_if_paid_was_empty(iid, 100)
+
+        it = self.repo.get_item(iid)
+        self.assertEqual(it['refund_amount'], 100.0)
+        from app.core import rules
+        self.assertEqual(rules.item_net_paid(it), 0.0, '全额退回后净额应为 0')
+
+    def test_an_explicit_refund_amount_is_left_alone(self):
+        iid = self.add(paid=100)
+        self.repo.set_refund(iid, refund_amount=30)
+        self.repo.bump_refund_if_paid_was_empty(iid, 100)
+        self.assertEqual(self.repo.get_item(iid)['refund_amount'], 30.0)
+
+    def test_a_non_refunded_item_is_untouched(self):
+        iid = self.add(paid=100)
+        self.repo.bump_refund_if_paid_was_empty(iid, 100)
+        self.assertEqual(self.repo.get_item(iid)['refund_amount'] or 0, 0)

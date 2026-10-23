@@ -182,3 +182,64 @@ class TestSplitBySupplier(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
+
+
+class TestDangerousUrlScheme(TestValidate):
+    """「网址链接」组员能随手填、采购会点开 —— 危险协议必须在入口就拒掉。
+
+    `javascript:` 开头的链接会被渲染成 <a href>，采购一点就在自己电脑上执行脚本。
+    """
+
+    def errs(self, url):
+        return rules.validate(self.base(url=url))[0]
+
+    def test_javascript_scheme_is_rejected(self):
+        self.assertTrue(self.errs('javascript:alert(1)'))
+
+    def test_uppercase_javascript_scheme_is_rejected(self):
+        self.assertTrue(self.errs('JavaScript:alert(1)'))
+
+    def test_data_scheme_is_rejected(self):
+        self.assertTrue(self.errs('data:text/html,<script>alert(1)</script>'))
+
+    def test_vbscript_and_file_are_rejected(self):
+        self.assertTrue(self.errs('vbscript:msgbox'))
+        self.assertTrue(self.errs('file:///C:/Windows/notepad.exe'))
+
+    def test_a_normal_http_link_is_still_fine(self):
+        self.assertEqual(self.errs('https://item.taobao.com/x'), [])
+        self.assertEqual(self.errs('http://m.tb.cn/abc'), [])
+
+    def test_a_supplier_name_is_still_fine(self):
+        """不填链接、直接写商家名称是允许的（一直如此）。"""
+        self.assertEqual(self.errs('中发电子市场'), [])
+
+    def test_a_colon_in_a_plain_name_is_not_a_scheme_complaint(self):
+        self.assertEqual(self.errs('机箱:先马'), [])
+
+
+class TestRefundedRowsDoNotAffectTheSplit(unittest.TestCase):
+    """拆单阈值按**净额**算：退掉的行不该把同商家推过一千。"""
+
+    def it(self, name, total, refunded=False, refund=0.0, url='同商家'):
+        return {'name': name, 'url': url, 'total': total,
+                'refunded': refunded, 'refund_amount': refund}
+
+    def test_a_full_refund_frees_the_other_rows(self):
+        items = [self.it('退掉的', 900, True, 900), self.it('新买的', 300)]
+        low, high, totals = rules.split_items(items, threshold=1000)
+        self.assertEqual([x['name'] for x in high], [])
+        self.assertEqual([x['name'] for x in low], ['退掉的', '新买的'])
+        self.assertEqual(list(totals.values())[0], 300.0)
+
+    def test_a_partial_refund_only_subtracts_the_returned_part(self):
+        items = [self.it('部分退', 600, True, 200), self.it('新买的', 300)]
+        low, high, totals = rules.split_items(items, threshold=1000)
+        self.assertEqual(list(totals.values())[0], 700.0, '600-200+300')
+        self.assertEqual(len(low), 2, '700 还没到一千')
+
+    def test_without_refunds_behaviour_is_unchanged(self):
+        items = [self.it('甲', 600), self.it('乙', 500)]
+        _, high, totals = rules.split_items(items, threshold=1000)
+        self.assertEqual(list(totals.values())[0], 1100.0)
+        self.assertEqual(len(high), 2)

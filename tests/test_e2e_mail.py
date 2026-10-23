@@ -82,9 +82,11 @@ class TestMailEndToEnd(LiveServerCase):
         rid = self.seed()
 
         # 1) 配邮箱（走 HTTP）
+        #    auto_attach=False：这条用例要走「待归档 → 看建议 → 手动挂」的老路，
+        #    自动挂会把票直接挂走（那条路见 tests/test_auto_attach.py）。
         r = self.client.put('/api/mail/config', json={
             'host': 'imap.example.com', 'user': 'a@example.com', 'password': '授权码',
-            'days': 7, 'keywords': ['发票'], 'max_mails': 50,
+            'days': 7, 'keywords': ['发票'], 'max_mails': 50, 'auto_attach': False,
         })
         self.assertEqual(r.status_code, 200, r.text)
         self.assertNotIn('password', r.json(), '授权码不该回传')

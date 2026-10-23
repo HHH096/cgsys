@@ -173,7 +173,14 @@ class TestFrontEndWiring(unittest.TestCase):
                              '组员入口不该调用 %s' % forbidden)
 
     def test_block_is_only_loaded_for_purchase(self):
-        self.assertIn('if (IS_PURCHASE) await loadBlock()', self.js)
+        """行块是采购专用数据，组员不该去拉。
+
+        三个采购专用请求现在打包在 `if (IS_PURCHASE)` 里**并行**发
+        （以前是三个串行 await，隧道下每次切轮次白等 0.5-1 秒）。
+        """
+        self.assertIn(
+            'await Promise.all([loadBlock(), loadShoppingList(), loadPayerSummary()])',
+            self.js)
 
     def test_member_identity_is_synced_to_the_server(self):
         self.assertIn("api('/api/me'", self.js)
@@ -210,3 +217,30 @@ class TestFrontEndWiring(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
+
+
+class TestProgressAmount(unittest.TestCase):
+    """进度接口的 `amount` 以前**永远算出 0** —— items 表根本没有 amount 列。"""
+
+    def test_it_reports_the_real_money(self):
+        from app.core import repo
+        from tests.support import TempDataTest
+
+        class Case(TempDataTest):
+            def runTest(self):
+                pass
+
+        c = Case()
+        c.setUp()
+        self.addCleanup(c.doCleanups)
+        mid = repo.add_member('张三', '')
+        rid = repo.create_round('九月采购')
+        repo.add_item(rid, mid, {'name': '电容', 'qty': 2, 'unit': '个',
+                                 'price': 5, 'purpose': 'x', 'applicant': '张三'})
+        from app.server.api import api_progress
+        from unittest import mock
+        with mock.patch.object(repo, 'list_items', wraps=repo.list_items):
+            p = api_progress(rid)
+        self.assertEqual(p['total'], 1)
+        self.assertGreater(p['amount'], 0, '不能是 0')
+        self.assertEqual(p['amount'], 10.0, '2 × 5 = 10')

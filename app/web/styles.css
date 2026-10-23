@@ -353,6 +353,71 @@ tr.newrow td { background: #fffbe8; }
 #memTable tr.newrow td:last-child { background: #fffbe8; }
 
 /* 改挂弹窗里的多选列表 */
-#pickList { width: 100%; box-sizing: border-box; font: inherit;
-  border: 1px solid var(--line); border-radius: 6px; padding: 4px; }
-#pickList option { padding: 4px 6px; }
+/* 多选列表样式在文件末尾的 .picklist / .pickitem（旧的 #pickList <select> 已换成可点的标签） */
+
+/* 合并打印的结果预览：直接嵌在卡片里看，不用另开窗口 */
+.preview-box { margin-top: 12px; border-top: 1px dashed var(--line); padding-top: 10px; }
+.preview-frame { width: 100%; height: 620px; margin-top: 8px; border: 1px solid var(--line);
+  border-radius: 8px; background: #f7f7f7; }
+
+/* 发票预览弹层：点「看发票」就地弹出来看，不用新开标签页（也就关得掉了） */
+.fileviewer {
+  position: fixed; inset: 0; z-index: 60;
+  background: rgba(18, 28, 20, .55);
+  display: flex; align-items: center; justify-content: center; padding: 18px;
+}
+.fileviewer[hidden] { display: none; }
+.fileviewer-box {
+  background: #fff; border-radius: 10px; padding: 12px 14px;
+  width: min(1000px, 100%); height: min(92vh, 900px);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, .28);
+  display: flex; flex-direction: column; gap: 8px;
+}
+.fileviewer-frame {
+  flex: 1; width: 100%; border: 1px solid var(--line);
+  border-radius: 8px; background: #f7f7f7;
+}
+
+/* 待购清单：采购照着它去淘宝下单 */
+.shopcard {
+  border: 1px solid var(--line); border-radius: 6px;
+  padding: 9px 11px; margin-bottom: 8px; background: #fbfdfb;
+}
+.shopcard .subj { font-weight: 600; }
+.shopcard .meta { color: #888; font-size: 12px; margin-top: 2px; }
+.shopcard .row { margin-top: 7px; }
+
+/* 填物料名称时提示「以前买过什么」，点一下带出规格/单价 */
+.history-box {
+  margin-top: 8px; padding: 8px 10px;
+  border: 1px dashed #cfe3cf; border-radius: 6px; background: #f7fbf7;
+}
+.history-box .sugg { margin-top: 6px; }
+
+/* 垫付结算：谁先掏了多少钱 */
+.payertable { width: 100%; border-collapse: collapse; font-size: 13px; }
+.payertable th, .payertable td {
+  text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line);
+}
+.payertable th { color: #666; font-weight: 600; background: #fafcf9; }
+.payertable td:last-child, .payertable th:last-child { text-align: right; }
+
+/* 「系统自动挂的」提示：人没点过它，得显眼一点 */
+.autonote { color: #b26a00; font-weight: 600; }
+
+/* 多选列表：点一下选中、再点一下取消 —— 手机上原生 multiple select 做不了多选 */
+.picklist {
+  display: flex; flex-wrap: wrap; gap: 6px;
+  border: 1px solid var(--line); border-radius: 8px;
+  padding: 8px; max-height: 260px; overflow-y: auto;
+  background: #fcfdfc; flex: 1 1 100%;
+}
+.pickitem {
+  padding: 9px 13px; border: 1px solid #ccd2d9; border-radius: 18px;
+  background: #fff; font-size: 13px; line-height: 1.2;
+  cursor: pointer; text-align: left; min-height: 38px;
+}
+.pickitem.on {
+  background: #eaf5ea; border-color: #7fbf7f; color: #0a5a0a; font-weight: 600;
+}
+.pickitem:active { transform: scale(0.98); }

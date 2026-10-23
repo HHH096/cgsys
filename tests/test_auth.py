@@ -316,3 +316,172 @@ class TestProgress(EntryCase):
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
+
+
+class TestFirstPasswordNeedsSetupCode(EntryCase):
+    """**首次设密码必须带服务器上的初始化码**。
+
+    这个路由要能匿名调用（不然死锁），但服务一旦暴露公网，
+    路人也能抢先把密码设了、把采购权限拿走。初始化码只写在服务器上，
+    所以「知道网址」不再等于「能夺权」。
+    """
+
+    def setUp(self):
+        super().setUp()
+        settings.set_password('')          # 回到「还没设过密码」
+        settings.clear_setup_code()
+        settings.reset_state()
+
+    def test_without_the_code_it_is_refused(self):
+        r = self.anon.post('/api/purchase/password', json={'new': 'abcd1234'})
+        self.assertEqual(r.status_code, 403)
+        self.assertFalse(settings.has_password(), '没带码就不该把密码设上')
+
+    def test_a_wrong_code_is_refused(self):
+        settings.setup_code()              # 先让码存在
+        r = self.anon.post('/api/purchase/password',
+                           json={'new': 'abcd1234', 'setup': 'DEADBEEF'})
+        self.assertEqual(r.status_code, 403)
+        self.assertFalse(settings.has_password())
+
+    def test_the_right_code_sets_the_password(self):
+        code = settings.setup_code()
+        r = self.anon.post('/api/purchase/password',
+                           json={'new': 'abcd1234', 'setup': code})
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(settings.has_password())
+        self.assertTrue(settings.check_password('abcd1234'))
+
+    def test_the_code_is_deleted_after_use(self):
+        """设好密码就把它删掉，别一直躺在磁盘上。"""
+        code = settings.setup_code()
+        self.assertTrue(settings.setup_code_file().exists())
+        self.anon.post('/api/purchase/password', json={'new': 'abcd1234', 'setup': code})
+        self.assertFalse(settings.setup_code_file().exists())
+
+    def test_the_code_ignores_case_and_surrounding_spaces(self):
+        code = settings.setup_code()
+        r = self.anon.post('/api/purchase/password',
+                           json={'new': 'abcd1234', 'setup': '  ' + code.lower() + '  '})
+        self.assertEqual(r.status_code, 200)
+
+    def test_an_old_deployment_without_a_code_file_can_still_set_one(self):
+        """从老版本升级上来时没有码文件 —— 第一次请求要能给出一个码，
+        否则永远设不了密码（但外人依然不知道它）。"""
+        self.assertFalse(settings.setup_code_file().exists())
+        r = self.anon.post('/api/purchase/password',
+                           json={'new': 'abcd1234', 'setup': '猜测'})
+        self.assertEqual(r.status_code, 403)
+        self.assertTrue(settings.setup_code_file().exists(), '应当补生成一个码')
+
+    def test_changing_an_existing_password_does_not_need_the_code(self):
+        """已经设过密码时，改密码靠旧密码验证，和初始化码无关。"""
+        settings.set_password(PW)
+        # setUp 里 reset 过登录态，这里重新登录一次
+        self.assertEqual(self.purchase.post('/api/purchase/login',
+                                            json={'password': PW}).status_code, 200)
+        r = self.purchase.post('/api/purchase/password',
+                               json={'old': PW, 'new': 'abcd1234'})
+        self.assertEqual(r.status_code, 200)
+
+
+class TestSessionExpiryIsHandled(unittest.TestCase):
+    """服务重启 → 内存里的登录凭证全没了。
+
+    以前前端完全不管 401：所有保存都失败、界面还显示旧数据，
+    人以为存上了其实什么都没写。现在必须**弹回登录门并停掉轮询**。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.js = (Path(__file__).resolve().parent.parent / 'app/web/app.js').read_text(
+            encoding='utf-8')
+
+    def test_the_api_helper_reacts_to_401(self):
+        seg = self.js.split('async function api(')[1].split('async function')[0]
+        self.assertIn('res.status === 401', seg)
+        self.assertIn('handleSessionExpired()', seg)
+
+    def test_login_endpoints_are_excluded(self):
+        """登录接口自己的 401 是「密码错」，不能当成会话过期去弹门。"""
+        self.assertIn("'/api/purchase/login'", self.js)
+        self.assertIn("'/api/member/login'", self.js)
+        seg = self.js.split('function isAuthPath(')[1].split('\n}')[0]
+        self.assertIn('AUTH_PATHS', seg)
+
+    def test_it_stops_the_polling_and_shows_the_gate(self):
+        seg = self.js.split('function handleSessionExpired(')[1].split('\n}')[0]
+        self.assertIn('clearInterval(startAutoRefresh._t)', seg)
+        self.assertIn('showLoginGate()', seg)
+        self.assertIn('showMemberGate()', seg)
+
+    def test_it_only_fires_once_per_burst(self):
+        """一屏十几个请求同时 401，只该弹一次。"""
+        seg = self.js.split('function handleSessionExpired(')[1].split('\n}')[0]
+        self.assertIn('_done', seg)
+        self.assertIn('return', seg)
+
+    def test_a_new_login_rearms_it(self):
+        self.assertIn('function resetSessionExpiredFlag(', self.js)
+        # 两个登录成功处各一次（函数定义里没有这个带分号的调用形式）
+        got = self.js.count('resetSessionExpiredFlag();')
+        self.assertGreaterEqual(got, 2, '采购登录和组员口令两处都要复位')
+
+
+class TestMemberCookieIsSigned(unittest.TestCase):
+    """组员身份 cookie 必须**签过名**。
+
+    以前 cookie 里就是明文 member id —— 把 `cgsys_member=7` 一改就成了别人，
+    改条目、改实付、删发票全能做（`_guard_own_item` 完全绕开）。
+    """
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+        from app import config
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root = Path(self._tmp.name)
+        for name, value in (('DATA_DIR', root),
+                            ('ATTACH_DIR', root / 'attachments'),
+                            ('INVOICE_DIR', root / 'invoices'),
+                            ('MAIL_INBOX_DIR', root / 'mail_inbox'),
+                            ('MAIL_CONFIG', root / 'mail.json'),
+                            ('EXPORT_DIR', root / 'export'),
+                            ('DB_PATH', root / 'procurement.db'),
+                            ('ROSTER_FILE', root / 'roster.txt')):
+            p = mock.patch.object(config, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_round_trip(self):
+        got = settings.sign_member(7)
+        self.assertEqual(settings.read_member(got), 7)
+
+    def test_the_value_is_not_a_plain_number(self):
+        self.assertNotEqual(settings.sign_member(7), '7')
+
+    def test_a_tampered_id_is_rejected(self):
+        """把 id 改大一位、签名不动 → 不认。"""
+        value = settings.sign_member(7)
+        raw, sig = value.rsplit('.', 1)
+        self.assertIsNone(settings.read_member('8.' + sig))
+
+    def test_a_tampered_signature_is_rejected(self):
+        value = settings.sign_member(7)
+        raw, sig = value.rsplit('.', 1)
+        self.assertIsNone(settings.read_member(raw + '.' + 'f' * len(sig)))
+
+    def test_the_old_plain_format_is_rejected(self):
+        """升级前的老 cookie（纯数字）一律当作没选名字。"""
+        self.assertIsNone(settings.read_member('7'))
+        self.assertIsNone(settings.read_member(''))
+        self.assertIsNone(settings.read_member(None))
+
+    def test_the_secret_is_stable_across_calls(self):
+        """密钥要落盘 —— 服务重启不能把所有人的身份弄丢。"""
+        a = settings.member_secret()
+        b = settings.member_secret()
+        self.assertEqual(a, b)
+        self.assertTrue(a)

@@ -20,6 +20,8 @@ import json
 import os
 import re
 import ssl
+import urllib.parse
+import urllib.request
 from dataclasses import asdict, dataclass, field, fields
 from datetime import date, timedelta
 from email import message_from_bytes
@@ -31,6 +33,28 @@ from app import config
 
 INVOICE_EXT = {'.pdf', '.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff', '.webp', '.xml', '.ofd'}
 DEFAULT_KEYWORDS = ['发票', 'invoice', 'fapiao', '电子发票', '增值税']
+
+# 有些发票平台**不发附件**，只在正文里放一条下载链接（淘宝/阿里就是这样）。
+# 收信时会去点这条链接把票取回来 —— 这等于让服务器**主动访问一个外网地址**，
+# 而邮件是谁都能发来的：不加限制的话，一封伪造的邮件就能让服务器去请求任意
+# URL（内网探测 / SSRF）。所以这里按域名白名单来，只认下面这些发票平台。
+#
+# 匹配规则是「域名相同，或是它的子域」：`einvoice.taobao.com` 命中 `taobao.com`，
+# 而 `evil-taobao.com` 不会命中（要求前面有点号）。
+INVOICE_LINK_HOSTS = (
+    'taobao.com',        # 淘宝 / 天猫电子发票平台（einvoice.taobao.com）
+    'tmall.com',
+    'alibaba.com',
+    'jd.com',            # 京东
+    'jss.com.cn',        # 百望云 / 航天信息系
+    'baiwang.com',
+    'nuonuo.com',        # 诺诺发票
+    'servyou.com.cn',    # 税友
+    'chinatax.gov.cn',   # 电子税务局
+)
+
+# 下载发票链接时的上限：一张电子发票几 MB 顶天了，别被大文件拖住
+LINK_MAX_BYTES = 20 * 1024 * 1024
 
 # (显示名, 服务器, 端口)
 PRESETS = [
@@ -65,6 +89,9 @@ class MailConfig:
     unseen_only: bool = False     # 只收未读
     keywords: List[str] = field(default_factory=lambda: list(DEFAULT_KEYWORDS))
     any_attachment: bool = False  # 收下所有附件（不看关键字）
+    link_download: bool = True    # 正文里只有下载链接的邮件（淘宝/阿里），去把票取回来
+    auto_attach: bool = True      # 收信后「只可能属于一条采购」的票直接挂上
+    scan_read: bool = False       # 也扫已读邮件（默认只看未读）
     mark_read: bool = False
     max_mails: int = 200          # 一次最多扫多少封
     auto_interval: int = 0        # 定时收取间隔（分钟），0 = 关闭
@@ -137,7 +164,7 @@ def build_criteria(cfg: MailConfig, today: Optional[date] = None) -> str:
     days = int(cfg.days or 0)
     if days > 0:
         parts.append('SINCE %s' % imap_date((today or date.today()) - timedelta(days=days)))
-    if cfg.unseen_only:
+    if cfg.unseen_only and not getattr(cfg, 'scan_read', False):
         parts.append('UNSEEN')
     return ' '.join(parts) if parts else 'ALL'
 
@@ -228,6 +255,139 @@ def iter_attachments(msg) -> List:
         if filename and payload:
             out.append((safe_filename(filename), payload))
     return out
+
+
+def host_allowed(url, hosts=INVOICE_LINK_HOSTS) -> bool:
+    """这个 URL 的域名在不在发票平台白名单里。
+
+    要求「域名相同，或是它的子域」—— 用点号卡住，`evil-taobao.com` 不算。
+    只认 https（发票平台都是 https；http 明文下载回来的东西不可信）。
+    """
+    try:
+        p = urllib.parse.urlsplit((url or '').strip())
+    except Exception:
+        return False
+    if p.scheme != 'https' or not p.hostname:
+        return False
+    host = p.hostname.lower().rstrip('.')
+    for base in hosts:
+        if host == base or host.endswith('.' + base):
+            return True
+    return False
+
+
+def html_text(msg) -> str:
+    """把邮件里 text/html / text/plain 的正文拼起来（用来找下载链接）。"""
+    chunks = []
+    parts = msg.walk() if msg.is_multipart() else [msg]
+    for part in parts:
+        ctype = (part.get_content_type() or '').lower()
+        if ctype not in ('text/html', 'text/plain'):
+            continue
+        if str(part.get('Content-Disposition') or '').lower().startswith('attachment'):
+            continue
+        try:
+            data = part.get_payload(decode=True)
+        except Exception:
+            data = None
+        if not data:
+            continue
+        charset = part.get_content_charset() or 'utf-8'
+        for enc in (charset, 'utf-8', 'gb18030', 'latin-1'):
+            try:
+                chunks.append(data.decode(enc))
+                break
+            except Exception:
+                continue
+    return '\n'.join(chunks)
+
+
+# 正文里指向「发票文件」的链接特征：要么 URL 本身像下载接口，要么锚文本写着下载/查看发票
+_LINK_URL_HINT = re.compile(
+    r'(invoice|fapiao|fphm|download|einvoice|e-invoice|dzeinvoice)', re.I)
+
+
+def extract_invoice_links(msg, hosts=INVOICE_LINK_HOSTS) -> List:
+    """从正文里挑出发票下载链接，返回去重后的 https URL 列表。
+
+    为什么需要这个：**淘宝/阿里的发票邮件里根本没有附件**，
+    正文 HTML 里只有一条 `downloadMailInvoice?token=...` 的链接。
+    只认附件的收信方式会把这种邮件整封跳过 —— 票就永远进不来。
+    """
+    html = html_text(msg)
+    if not html:
+        return []
+    out = []
+    # href / src 都看：有的平台把发票地址放在按钮的 src 上
+    for raw in re.findall(r'(?:href|src)\s*=\s*["\']([^"\']+)["\']', html, re.I):
+        url = raw.replace('&amp;', '&').strip()
+        if url.startswith('//'):                 # 协议相对，补成 https
+            url = 'https:' + url
+        if not url.lower().startswith('https://'):
+            continue
+        if not host_allowed(url, hosts):
+            continue
+        # 特征词只查**路径和查询串**，不查主机名 ——
+        # 否则 einvoice.taobao.com 下任何一条链接（比如 /help/index.html）
+        # 都会因为域名里带着 einvoice 被误当成发票下载地址。
+        p = urllib.parse.urlsplit(url)
+        if not _LINK_URL_HINT.search(p.path + '?' + p.query):
+            continue
+        if url not in out:
+            out.append(url)
+    return out
+
+
+# 内容嗅探：发票平台给的 Content-Type 常常是 octet-stream，靠不住，看魔数更实在
+_SNIFF = [
+    (b'%PDF', '.pdf'),
+    (b'PK\x03\x04', '.pdf'),      # OFD / zip 包着的 PDF，先按 pdf 存，后面能转
+    (b'\x89PNG', '.png'),
+    (b'\xff\xd8\xff', '.jpg'),
+    (b'BM', '.bmp'),
+    (b'II*\x00', '.tif'),
+    (b'MM\x00*', '.tif'),
+]
+
+
+def sniff_ext(data, fallback='.pdf') -> str:
+    for magic, ext in _SNIFF:
+        if data[:len(magic)] == magic:
+            return ext
+    return fallback
+
+
+def download_invoice_link(url, opener=None, max_bytes=LINK_MAX_BYTES):
+    """把发票链接取回来，返回 (文件名, bytes)；失败抛异常。
+
+    `opener` 只为测试注入（默认走 urllib）。**只下白名单域名**这件事在
+    `extract_invoice_links` 里已经把过关，这里再断言一次，双保险。
+    """
+    if not host_allowed(url):
+        raise ValueError('不下载非发票平台的地址：%s' % url)
+    req = urllib.request.Request(url, headers={
+        'User-Agent': 'Mozilla/5.0 (compatible; cgsys-invoice-fetch)',
+        'Accept': 'application/pdf,application/octet-stream,*/*',
+    })
+    open_fn = opener or (lambda r: urllib.request.urlopen(r, timeout=30))
+    with open_fn(req) as resp:
+        data = resp.read(max_bytes + 1)
+        ctype = (resp.headers.get('Content-Type') or '').lower() if resp.headers else ''
+    if len(data) > max_bytes:
+        raise ValueError('文件太大（超过 %d MB）' % (max_bytes // 1024 // 1024))
+    if not data:
+        raise ValueError('取回来是空的')
+    ext = sniff_ext(data)
+    if ext == '.pdf' and not data[:5] == b'%PDF' and data[:2] != b'PK':
+        # 嗅不出来又想当 pdf —— 看 Content-Type 兜一下；都不像就报错，别存垃圾
+        if 'pdf' not in ctype and 'octet-stream' not in ctype:
+            raise ValueError('取回来的不是发票文件（Content-Type: %s）' % ctype)
+    name = urllib.parse.unquote(os.path.basename(
+        urllib.parse.urlsplit(url).path) or '') or 'invoice'
+    name = safe_filename(name)
+    if not os.path.splitext(name)[1]:
+        name += ext
+    return name, data
 
 
 def filter_attachments(msg, cfg: MailConfig) -> List:
@@ -411,6 +571,19 @@ def fetch_attachments(cfg: MailConfig, client=None, skip_uids: Sequence[str] = (
             sender = decode_mime_header(msg.get('From', ''))
             when = decode_mime_header(msg.get('Date', ''))
             picked = filter_attachments(msg, cfg)
+            if not picked and getattr(cfg, 'link_download', True):
+                # 没有附件不代表没有发票：淘宝/阿里只把下载链接放在正文里，
+                # 这里去把票取回来（链接域名过白名单，见 extract_invoice_links）。
+                for url in extract_invoice_links(msg):
+                    try:
+                        name, data = download_invoice_link(url)
+                    except Exception as exc:
+                        result['errors'].append('取发票链接失败（%s）：%s'
+                                                % (url[:80], error_text(exc)))
+                        log('取链接失败：%s' % url[:80])
+                        continue
+                    picked.append((name, data))
+                    log('从正文链接取到发票：%s' % name)
             if not picked:
                 result['skipped'].append({'uid': uid, 'reason': '没有像发票的附件'})
                 continue

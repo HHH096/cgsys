@@ -61,12 +61,23 @@ HIGH_WIDTHS = list(SPLIT_WIDTHS[:-1]) + [11.4]
 
 
 def _blank(v):
-    """空字符串写 None，保持表格干净。"""
+    """空字符串写 None，保持表格干净；**以 = + - @ 开头的要防公式注入**。
+
+    openpyxl 会把 `=` 开头的字符串当公式写进单元格。组员在物料名称或备注里
+    填 `=HYPERLINK("http://…","点我")`，采购一打开导出的表格就可能被带到外链、
+    或者触发 Excel 的外部数据请求。
+
+    前面加个单引号，Excel 就按普通文本处理（单元格显示时不带引号）。
+    """
     if v is None:
         return None
     if isinstance(v, str):
         v = v.strip()
-        return v if v else None
+        if not v:
+            return None
+        if v[0] in '=+-@':
+            return "'" + v
+        return v
     return v
 
 

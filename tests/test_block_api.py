@@ -166,7 +166,8 @@ class TestFrontendWiring(unittest.TestCase):
 
     def test_rendered_on_load_and_refresh(self):
         self.assertIn('renderBlock();', self.js, 'renderAll 里要刷新行块')
-        self.assertIn('await loadBlock();', self.js, '换轮次时要重新取行块')
+        # 换轮次时要重新取行块；三个采购请求现在并行发，所以断言的是并行写法
+        self.assertIn('Promise.all([loadBlock(),', self.js, '换轮次时要重新取行块')
 
     def test_copy_falls_back_when_clipboard_api_is_unavailable(self):
         """局域网走 http，navigator.clipboard 会被浏览器拒绝，必须有降级。"""

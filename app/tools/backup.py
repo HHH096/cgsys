@@ -6,7 +6,8 @@
 1. **数据库用 SQLite 自己的 backup API 导一份快照再打包**，不是直接拷文件 ——
    服务正在写的时候直接拷 `.db` 有可能拿到不一致的半截文件。
 2. 备份里包含 `data\\` 下的**全部**东西：数据库、发票归档、邮箱待归档、样式图片、邮箱配置。
-   恢复就是把 zip 解压回项目根目录覆盖 `data\\`。
+   恢复是把 zip 解压到 **`data\\` 目录里面**（zip 内是 `data` 的内部相对路径，
+   不带 `data/` 这一层）—— 解压到项目根目录会变成 `项目根\\procurement.db`，等于没恢复。
 """
 import os
 import sqlite3
@@ -148,7 +149,8 @@ def main(argv=None) -> int:
               % (len(info['removed']), '、'.join(info['removed'])))
     print('  保留最近 %d 份。' % keep)
     print()
-    print('恢复办法：把 zip 解压回项目根目录，覆盖掉原来的 data 目录即可。')
+    print('恢复办法：把 zip 解压到 data 目录里面（zip 内不带 data/ 这一层），'
+          '覆盖同名文件后重启服务。')
     return 0
 
 

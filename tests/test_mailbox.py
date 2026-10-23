@@ -176,6 +176,11 @@ class TestCriteria(unittest.TestCase):
     def test_neither_is_all(self):
         self.assertEqual(mailbox.build_criteria(mailbox.MailConfig(days=0)), 'ALL')
 
+    def test_scan_read_drops_the_unseen_filter(self):
+        """勾了「也扫已读」，就不能再带 UNSEEN —— 否则已读邮件永远不看。"""
+        cfg = mailbox.MailConfig(days=0, unseen_only=True, scan_read=True)
+        self.assertEqual(mailbox.build_criteria(cfg), 'ALL')
+
 
 class TestHeaderDecode(unittest.TestCase):
 
@@ -423,6 +428,124 @@ class TestPython38Compat(unittest.TestCase):
         self.assertLess(src.index('conn.login'),
                         src.index('send_client_id(conn)'),
                         'send_client_id 要在 login 之后调用')
+
+
+class FakeResp:
+    """替代 urllib 的响应对象（下载发票链接时用）。"""
+
+    def __init__(self, data, ctype='application/octet-stream'):
+        self._data = data
+        self.headers = {'Content-Type': ctype}
+
+    def read(self, n=-1):
+        return self._data if n is None or n < 0 else self._data[:n]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+ALI_LINK = ('https://einvoice.taobao.com//api/invoice/downloadMailInvoice'
+            '?token=017l-3RwGLesBWCJ&from=mail')
+
+
+def build_html_mail(html, subject='【阿里发票平台】电子发票附件查收',
+                    sender='noreply@notice.invoice-mail.taobao.com'):
+    """淘宝/阿里那种**没有附件、正文里只有下载链接**的邮件。"""
+    msg = EmailMessage()
+    msg['Subject'] = subject
+    msg['From'] = sender
+    msg['Date'] = 'Mon, 06 Oct 2026 10:00:00 +0800'
+    msg.set_content(html, subtype='html')
+    return msg
+
+
+class TestInvoiceLinkHosts(unittest.TestCase):
+    """白名单是**安全边界**：邮件谁都能发来，不能让它指挥服务器去请求任意地址。"""
+
+    def test_the_platform_domain_is_allowed(self):
+        self.assertTrue(mailbox.host_allowed(ALI_LINK))
+
+    def test_a_subdomain_is_allowed(self):
+        self.assertTrue(mailbox.host_allowed('https://einvoice.jd.com/x'))
+
+    def test_a_lookalike_domain_is_refused(self):
+        """`evil-taobao.com` 结尾也带 taobao.com —— 必须靠点号卡死。"""
+        self.assertFalse(mailbox.host_allowed('https://evil-taobao.com/x'))
+        self.assertFalse(mailbox.host_allowed('https://taobao.com.evil.net/x'))
+
+    def test_plain_http_is_refused(self):
+        self.assertFalse(mailbox.host_allowed('http://einvoice.taobao.com/x'))
+
+    def test_an_unrelated_host_is_refused(self):
+        self.assertFalse(mailbox.host_allowed('https://example.com/invoice.pdf'))
+
+    def test_internal_addresses_are_refused(self):
+        """别把自己当成 SSRF 跳板去探内网。"""
+        for u in ('https://127.0.0.1/invoice', 'https://localhost/x',
+                  'https://169.254.169.254/latest/meta-data/'):
+            self.assertFalse(mailbox.host_allowed(u), u)
+
+
+class TestExtractInvoiceLinks(unittest.TestCase):
+
+    def test_pulls_the_download_link_out_of_the_html(self):
+        html = '<a href="%s">下载发票</a>' % ALI_LINK
+        links = mailbox.extract_invoice_links(roundtrip(build_html_mail(html)))
+        self.assertEqual(links, [ALI_LINK])
+
+    def test_html_escaped_ampersand_is_decoded(self):
+        html = '<a href="%s">下载</a>' % ALI_LINK.replace('&', '&amp;')
+        self.assertEqual(mailbox.extract_invoice_links(roundtrip(build_html_mail(html))),
+                         [ALI_LINK])
+
+    def test_a_non_platform_link_is_ignored(self):
+        html = '<a href="https://evil.com/invoice/download?f=1">下载发票</a>'
+        self.assertEqual(mailbox.extract_invoice_links(roundtrip(build_html_mail(html))), [])
+
+    def test_a_platform_link_that_is_not_an_invoice_is_ignored(self):
+        """淘宝邮件里还夹着「联系卖家」这类链接，别一起拉下来。"""
+        html = '<a href="https://einvoice.taobao.com//help/index.html">帮助</a>'
+        self.assertEqual(mailbox.extract_invoice_links(roundtrip(build_html_mail(html))), [])
+
+    def test_duplicate_links_appear_once(self):
+        html = '<a href="%s">a</a><img src="%s">' % (ALI_LINK, ALI_LINK)
+        self.assertEqual(len(mailbox.extract_invoice_links(roundtrip(build_html_mail(html)))), 1)
+
+    def test_a_mail_without_html_gives_nothing(self):
+        self.assertEqual(mailbox.extract_invoice_links(roundtrip(build_mail())), [])
+
+
+class TestDownloadInvoiceLink(unittest.TestCase):
+
+    def test_downloads_a_pdf_and_names_it(self):
+        name, data = mailbox.download_invoice_link(
+            ALI_LINK, opener=lambda r: FakeResp(b'%PDF-1.5 real invoice'))
+        self.assertTrue(name.endswith('.pdf'), name)
+        self.assertEqual(data, b'%PDF-1.5 real invoice')
+
+    def test_a_png_is_recognised_by_content_not_by_header(self):
+        """平台给的 Content-Type 常是 octet-stream，只能靠魔数认。"""
+        png = b'\x89PNG\r\n\x1a\n' + b'0' * 40
+        name, _ = mailbox.download_invoice_link(
+            ALI_LINK, opener=lambda r: FakeResp(png))
+        self.assertTrue(name.endswith('.png'), name)
+
+    def test_a_non_platform_url_is_refused_even_here(self):
+        with self.assertRaises(ValueError):
+            mailbox.download_invoice_link('https://evil.com/invoice.pdf',
+                                          opener=lambda r: FakeResp(b'%PDF-1.5'))
+
+    def test_an_oversized_file_is_refused(self):
+        big = b'%PDF-1.5' + b'0' * (mailbox.LINK_MAX_BYTES + 10)
+        with self.assertRaises(ValueError):
+            mailbox.download_invoice_link(ALI_LINK, opener=lambda r: FakeResp(big))
+
+    def test_an_empty_response_is_refused(self):
+        with self.assertRaises(ValueError):
+            mailbox.download_invoice_link(ALI_LINK, opener=lambda r: FakeResp(b''))
 
 
 if __name__ == '__main__':

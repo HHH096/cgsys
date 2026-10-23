@@ -64,6 +64,8 @@ CREATE TABLE IF NOT EXISTS items (
 
 CREATE INDEX IF NOT EXISTS idx_items_round  ON items(round_id);
 CREATE INDEX IF NOT EXISTS idx_items_member ON items(member_id);
+-- 填单时按物料名查历史（repo.item_history），没索引是全表扫
+CREATE INDEX IF NOT EXISTS idx_items_name   ON items(name);
 
 CREATE TABLE IF NOT EXISTS invoices (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -97,12 +99,19 @@ CREATE TABLE IF NOT EXISTS mail_inbox (
     status      TEXT    NOT NULL DEFAULT 'pending',
     item_id     INTEGER REFERENCES items(id) ON DELETE SET NULL,
     invoice_id  INTEGER REFERENCES invoices(id) ON DELETE SET NULL,
+    -- 这张票是**系统自己挂上去的**（1）还是人点的（0）。
+    -- 自动挂的必须能一眼看出来 —— 人看到「我没点过它却挂上了」才会去核对。
+    auto_attached INTEGER NOT NULL DEFAULT 0,
     created_at  TEXT    NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_mail_inbox_status ON mail_inbox(status);
 CREATE INDEX IF NOT EXISTS idx_mail_inbox_sha1   ON mail_inbox(sha1);
 CREATE INDEX IF NOT EXISTS idx_mail_inbox_uid    ON mail_inbox(mail_uid);
+-- 外键索引：item_id / invoice_id 是 ON DELETE SET NULL 的外键，
+-- 没索引时 SQLite 每次删条目/删发票都要**全表扫 mail_inbox**（官方明确警告的那种）。
+CREATE INDEX IF NOT EXISTS idx_mail_inbox_item    ON mail_inbox(item_id);
+CREATE INDEX IF NOT EXISTS idx_mail_inbox_invoice ON mail_inbox(invoice_id);
 
 -- 发票 ↔ 条目 的多对多关系。
 --
@@ -147,6 +156,10 @@ MIGRATIONS = [
     # 是很正常的事，那种不该互相拦。
     ('items', 'rev',
      'ALTER TABLE items ADD COLUMN rev INTEGER NOT NULL DEFAULT 0'),
+    # 自动挂载标记：收信时如果**只可能属于一条采购**，系统会直接挂上去（见 mailfetch.auto_attach）。
+    # 人看到「我没点过它却挂上了」时，得能立刻分辨出来去核对。
+    ('mail_inbox', 'auto_attached',
+     'ALTER TABLE mail_inbox ADD COLUMN auto_attached INTEGER NOT NULL DEFAULT 0'),
 ]
 
 
@@ -155,10 +168,16 @@ def backfill_invoice_items(conn):
 
     **幂等**：`INSERT OR IGNORE` + 主键 (invoice_id, item_id)，
     跑多少遍都不会重复。返回这次实际插了几行。
+
+    `item_id IN (SELECT id FROM items)` 是防御：万一库里有孤儿行
+    （`invoices.item_id` 指向已经不存在的条目 —— 手工改过库、或者老版本留下的），
+    外键会直接让 `INSERT` 抛错，而这个函数是在 `init_db()` 里跑的 ——
+    于是**服务根本起不来**。跳过这些行，让程序先能启动。
     """
     cur = conn.execute(
         'INSERT OR IGNORE INTO invoice_items (invoice_id, item_id, created_at) '
-        'SELECT id, item_id, created_at FROM invoices WHERE item_id IS NOT NULL'
+        'SELECT id, item_id, created_at FROM invoices '
+        'WHERE item_id IS NOT NULL AND item_id IN (SELECT id FROM items)'
     )
     return cur.rowcount
 

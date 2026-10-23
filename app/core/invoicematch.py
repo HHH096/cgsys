@@ -80,3 +80,46 @@ def match_lines(lines, items):
             out.append({'line': li, 'item_id': None,
                         'why': '没能自动认出来，请手选', 'gap': None})
     return out
+
+
+def match_invoices_to_items(uploads, items):
+    """把「一批上传的发票」各自配到一条采购上 —— 名称优先，金额兜底，一条采购只配一次。
+
+    uploads: [{'key': 标识（一般是文件名）, 'name': 票面名（可能为空）, 'amount': 金额或 None}]
+    items:   本轮采购条目（含 id / name / total / paid）
+
+    为什么单独写一个、不复用 `match_lines`：那边是「一张票的多行明细」配多条采购，
+    行有名称可以比。这边是**整张票配一条采购**，而且返工重开的票多半是照片/扫描件
+    （没有文字层，读不出名称），**金额才是稳的信号** —— 名称只在金额接近时用来挑。
+
+    返回 `{key: item_id}`，配不上的那一项**不带 key**（调用方按「背面留空」处理）。
+    """
+    cands = []
+    for u in uploads:
+        for it in items:
+            hit = name_hit(u.get('name'), it.get('name')) if u.get('name') else 0
+            amt = u.get('amount')
+            if amt is None:
+                # 金额都读不出来的票（照片票且 OCR 也没认出来）：
+                # 只认名字完全吻合的，还要金额对得上——否则宁可不配。
+                ihave = it.get('paid') if it.get('paid') is not None else it.get('total')
+                if hit != 2 or ihave is None:
+                    continue
+                gap = 0.0
+            else:
+                ihave = it.get('paid') if it.get('paid') is not None else it.get('total')
+                if ihave is None:
+                    continue
+                gap = abs(round(float(amt), 2) - round(float(ihave), 2))
+                if hit == 0 and gap > MAX_GAP_WHEN_NO_NAME:
+                    continue
+            cands.append((-hit, gap, u.get('key'), it['id']))
+
+    cands.sort()
+    taken, used = {}, set()
+    for neg_hit, gap, key, iid in cands:
+        if key in taken or iid in used:
+            continue
+        taken[key] = iid
+        used.add(iid)
+    return taken

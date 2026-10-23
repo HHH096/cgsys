@@ -340,3 +340,64 @@ class TestFrontendWiring(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
+
+
+class TestPaidIsProtectedByRev(EntryCase):
+    """两个人同时填同一条的实付金额 —— 后写的不该默默把前一个盖掉。
+
+    真实场景：采购在电脑上填，组长在手机上同时填；或者同一个人开了两个标签页。
+    没有版本校验时，后到的那个会把人家的数字冲掉，对账差额跟着错，而且**没人会发现**。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.iid = repo.add_item(self.rid, self.alice, {
+            'name': '电容', 'qty': 1, 'unit': '个', 'price': 22,
+            'purpose': 'x', 'applicant': '李四'})
+        repo.set_item_status(self.iid, order_status='已下单')
+
+    def rev(self):
+        return repo.get_item(self.iid)['rev']
+
+    def test_a_stale_rev_is_rejected(self):
+        stale = self.rev()
+        # 别人先填了一次，rev 变了
+        self.assertEqual(self.purchase.post('/api/items/%d/paid' % self.iid,
+                                            json={'paid': 22.0, 'base_rev': stale}).status_code, 200)
+        self.assertNotEqual(self.rev(), stale)
+
+        r = self.purchase.post('/api/items/%d/paid' % self.iid,
+                               json={'paid': 99.0, 'base_rev': stale})
+        self.assertEqual(r.status_code, 409, r.text)
+        self.assertEqual(repo.get_item(self.iid)['paid'], 22.0, '不能被后来的覆盖')
+
+    def test_a_fresh_rev_is_accepted(self):
+        r = self.purchase.post('/api/items/%d/paid' % self.iid,
+                               json={'paid': 22.5, 'base_rev': self.rev()})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(repo.get_item(self.iid)['paid'], 22.5)
+
+    def test_without_a_rev_it_is_not_checked(self):
+        """脚本、老页面不传 base_rev，行为照旧（不然一升级就全坏）。"""
+        r = self.purchase.post('/api/items/%d/paid' % self.iid, json={'paid': 33.0})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(repo.get_item(self.iid)['paid'], 33.0)
+
+    def test_a_member_gets_the_same_protection(self):
+        """组员补自己那条时同样受保护 —— 这才是「同时填」最常见的场景。"""
+        stale = self.rev()
+        self.alice_c.post('/api/items/%d/paid' % self.iid, json={'paid': 20.0})
+        r = self.alice_c.post('/api/items/%d/paid' % self.iid,
+                              json={'paid': 30.0, 'base_rev': stale})
+        self.assertEqual(r.status_code, 409, r.text)
+        self.assertEqual(repo.get_item(self.iid)['paid'], 20.0)
+
+    def test_nothing_is_written_when_rejected(self):
+        stale = self.rev()
+        self.purchase.post('/api/items/%d/paid' % self.iid, json={'paid': 11.0})
+        before = repo.get_item(self.iid)
+        self.purchase.post('/api/items/%d/paid' % self.iid,
+                           json={'paid': 77.0, 'base_rev': stale})
+        after = repo.get_item(self.iid)
+        self.assertEqual(after['paid'], before['paid'])
+        self.assertEqual(after['rev'], before['rev'], '被拒的请求不该把 rev 也改掉')

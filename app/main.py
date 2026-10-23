@@ -63,6 +63,15 @@ def main():
         print('  已补全已存在的组员：%s' % '、'.join(roster_summary['updated']))
     for b in roster_summary['bad']:
         print('  组员名单.txt 第 %s 行没认出来（%s）：%s' % (b['line'], b['why'], b['text']))
+    # 还没设采购密码时，把初始化码打出来 —— 首次设密码要它，
+    # 只有能看到服务器日志/文件的人才知道，防止公网上被人抢先夺权。
+    try:
+        from app.core import settings
+        if not settings.has_password():
+            print('  采购入口还没设密码，首次设置需要初始化码：%s' % settings.setup_code())
+            print('  （也写在 data/setup-code.txt 里；设好密码后这个文件会自动删掉）')
+    except Exception:
+        pass
     print()
 
     from app.server.api import app as asgi_app

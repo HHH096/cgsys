@@ -35,6 +35,8 @@ document.documentElement.className =
            autocomplete="current-password">
     <input id="loginPw2" type="password" placeholder="再输一遍"
            autocomplete="new-password" hidden>
+    <input id="loginSetup" type="text" placeholder="初始化码（见服务器 data/setup-code.txt）"
+           autocomplete="off" hidden>
     <div id="loginMsg" class="msg"></div>
     <button class="primary" type="submit" id="loginBtn">进入采购工作台</button>
   </form>
@@ -111,6 +113,7 @@ document.documentElement.className =
         <label>谁垫的钱<input id="f_payer" list="payers" placeholder="自己先垫的才填"></label>
         <datalist id="payers"></datalist>
       </div>
+      <div id="nameHistory" class="history-box" hidden></div>
       <div class="row">
         <span id="calcHint" class="muted"></span>
         <span class="spacer"></span>
@@ -119,6 +122,24 @@ document.documentElement.className =
       </div>
       <div id="formMsg" class="msg"></div>
     </form>
+  </section>
+
+  <section class="card purchase-only">
+    <h2>待购清单</h2>
+    <div class="row">
+      <span id="shopHint" class="muted small"></span>
+      <span class="spacer"></span>
+      <button id="shopOpenAll" class="ghost" type="button" title="浏览器一次点击只放行一个窗口；要批量开请按住 Ctrl 逐条点">打开第一条</button>
+      <button id="shopCopy" class="ghost" type="button">复制清单</button>
+    </div>
+    <p class="muted small">
+      这里是<b>还要买</b>的条目：待下单、没退货、也没人垫付（垫付说明他自己已经买了）。
+      点「打开商品页」直接跳到商品页下单，不用再复制到手机上；
+      <b>按住 Ctrl 点（或鼠标中键）可以一次开好几个</b>——浏览器一次点击只放行一个窗口，
+      所以「打开第一条」只能开一个，这是浏览器的限制，不是坏了。
+      规格按原文显示 —— 淘宝的规格选项名不一定一样，下单时对一眼。
+    </p>
+    <div id="shopList"></div>
   </section>
 
   <section class="card purchase-only">
@@ -146,7 +167,10 @@ document.documentElement.className =
       </div>
       <div class="row">
         <label class="inline"><input type="checkbox" id="m_unseen"> 只收未读</label>
+        <label class="inline"><input type="checkbox" id="m_scanread"> 也扫已读邮件</label>
         <label class="inline"><input type="checkbox" id="m_any"> 收下所有附件（不看关键字）</label>
+        <label class="inline"><input type="checkbox" id="m_linkdl"> 正文里有发票链接就取回来（淘宝/阿里）</label>
+        <label class="inline"><input type="checkbox" id="m_autoattach"> 收到就自动挂到条目上（只挂金额唯一对得上的）</label>
         <span class="spacer"></span>
         <button id="mailSave" class="ghost" type="button">保存设置</button>
       </div>
@@ -178,11 +202,53 @@ document.documentElement.className =
       <button id="mergePdf" class="primary" type="button">生成并下载</button>
       <button id="invoicesZip" class="ghost" type="button">打包下载发票 zip</button>
     </div>
+    <div class="row">
+      <span class="muted small">从本机上传合并（返工重开的票，不入账）：</span>
+      <input type="file" id="mergeFiles" multiple accept=".pdf,.png,.jpg,.jpeg,.bmp,.tif,.tiff">
+      <span id="mergeFileHint" class="muted small"></span>
+      <span class="spacer"></span>
+      <button id="mergeUpload" class="ghost" type="button">上传并合并下载</button>
+    </div>
+    <div class="row">
+      <span class="muted small">背面去哪几轮里配：</span>
+      <div id="mergeRounds" class="picklist"></div>
+      <button id="mergeRoundsAll" class="ghost" type="button">全选</button>
+      <button id="mergeRoundsNone" class="ghost" type="button">全不选</button>
+      <span id="mergeRoundsHint" class="muted small"></span>
+    </div>
+    <p class="muted small">
+      选几张本机的发票文件（PDF，或 jpg / png / bmp / tif 照片，图片会先转成 PDF）
+      直接合成一份，用完即弃 —— 不会进本轮的发票账。
+      背面拿票面金额去本轮条目里自动配，配上就印那条的信息，配不上留空手写。
+    </p>
     <p class="muted small">
       把本轮收到的发票按 A4 每页 N 张合成一份 PDF：正面是发票，背面是它对应的采购信息
       （物品名称 / 用途 / 组别 / 付款日期（留空手写）/ 归属表格（印「月」，左侧留白写月份数字））。
       双面打印时选「长边翻转（长边装订）」，每张发票背面就是它自己的信息。
     </p>
+    <div id="mergePreviewBox" class="preview-box" hidden>
+      <div class="row">
+        <strong id="mergePreviewTitle">合并结果预览</strong>
+        <span id="mergePreviewHint" class="muted small"></span>
+        <span class="spacer"></span>
+        <button id="mergePreviewPrint" class="ghost" type="button">打印</button>
+        <button id="mergePreviewDownload" class="ghost" type="button">下载</button>
+        <button id="mergePreviewClose" class="ghost" type="button">关闭预览</button>
+      </div>
+      <iframe id="mergePreviewFrame" title="合并结果预览" class="preview-frame"></iframe>
+    </div>
+  </section>
+
+  <section class="card purchase-only">
+    <h2>垫付结算</h2>
+    <div class="row">
+      <span id="payerHint" class="muted small"></span>
+    </div>
+    <p class="muted small">
+      这轮<b>谁自己先掏了钱、一共多少</b>（退货按净额算）。这钱要找车队报，
+      照着这张表转账就行。
+    </p>
+    <div id="payerList"></div>
   </section>
 
   <section class="card purchase-only">
@@ -363,12 +429,26 @@ document.documentElement.className =
 <div id="pickBar" class="askbar" hidden>
   <div class="askbox">
     <p id="pickMsg"></p>
-    <select id="pickList" multiple size="8"></select>
-    <p class="muted small">一张发票可以挂多条 —— 按住 Ctrl 点（手机上直接点）可以多选。</p>
+    <div id="pickList" class="picklist"></div>
+    <p class="muted small">一张发票可以挂多条 —— <b>点一下选中，再点一下取消</b>（手机上直接点就行）。</p>
     <div class="row">
       <button id="pickOk" type="button">确定</button>
       <button id="pickCancel" type="button" class="ghost">取消</button>
     </div>
+  </div>
+</div>
+
+<!-- 发票预览弹层：待归档的票、已归档的票都在这儿看，看完点「关闭」即可 -->
+<div id="fileViewer" class="fileviewer" hidden>
+  <div class="fileviewer-box">
+    <div class="row">
+      <strong id="fileViewerTitle">发票</strong>
+      <span id="fileViewerHint" class="muted small"></span>
+      <span class="spacer"></span>
+      <a id="fileViewerDownload" class="mini" href="#">下载</a>
+      <button id="fileViewerClose" type="button">关闭</button>
+    </div>
+    <iframe id="fileViewerFrame" title="发票预览" class="fileviewer-frame"></iframe>
   </div>
 </div>
 

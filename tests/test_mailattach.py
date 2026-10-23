@@ -23,8 +23,10 @@ class AttachCase(TempDataTest):
         return repo.get_item(repo.add_item(self.rid, self.mid, data))
 
     def collect(self, **over):
+        # 这里测的是「待归档 + 建议」那条路，所以要**关掉自动挂** ——
+        # 否则金额能对上的票会被自动挂走，待归档里就空了（那是另一组用例的事）。
         cfg = mailbox.MailConfig(host='imap.example.com', user='a@example.com',
-                                 password='x', days=0)
+                                 password='x', days=0, auto_attach=False)
         kw = {'subject': '电子发票', 'filename': 'invoice.pdf'}
         kw.update(over)
         r = mailfetch.collect(cfg, client=FakeClient([('1', build_mail(**kw).as_bytes())]))
@@ -54,6 +56,25 @@ class TestExtractAmounts(unittest.TestCase):
     def test_empty(self):
         self.assertEqual(mailfetch.extract_amounts(''), [])
         self.assertEqual(mailfetch.extract_amounts(None), [])
+
+    def test_yen_must_not_reach_across_a_newline(self):
+        """真票把「¥」和金额分列排版，跨行会抓到下一行的校验码。
+
+        实测：一张 ¥52.05 的电子发票，校验码 `5127780276067125116` 被当成金额，
+        读出来 5.1e18 —— 预填进「实付金额」就是把对账彻底搞乱。
+        """
+        text = ('合        计\n（小写）\n¥52.05\n'
+                '5127780276067125116;\n')
+        self.assertEqual(mailfetch.extract_amounts(text), [52.05])
+
+    def test_a_long_digit_run_is_not_an_amount(self):
+        """账号 / 校验码那种一长串数字不是金额。"""
+        self.assertEqual(mailfetch.extract_amounts('校验码 5127780276067125116'), [])
+
+    def test_still_reads_the_normal_cases(self):
+        self.assertEqual(mailfetch.extract_amounts('价税合计 ¥52.05'), [52.05])
+        self.assertEqual(mailfetch.extract_amounts('￥ 16.00'), [16.0])
+        self.assertEqual(mailfetch.extract_amounts('invoice total 157.92 yuan'), [157.92])
 
 
 class TestSuggest(AttachCase):

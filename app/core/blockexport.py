@@ -123,13 +123,31 @@ def reconcile(items, round_=None):
     }
 
 
+def _safe(v):
+    """写单元格前的清洗：空字符串写 None；**防公式注入**。
+
+    以 `= + - @` 开头的字符串会被 openpyxl 当公式写进去 ——
+    组员在物料名称/备注里填 `=HYPERLINK(...)`，采购打开导出表就可能被带到外链。
+    前面加单引号，Excel 按普通文本处理。
+    """
+    if v is None or v == '':
+        return None
+    if isinstance(v, str):
+        v = v.strip()
+        if not v:
+            return None
+        if v[0] in '=+-@':
+            return "'" + v
+    return v
+
+
 def build_block_workbook(items, group=None, recon=None):
     """返回 Workbook：`行块`（纯数据，从 A1 起）+ `对账`。"""
     wb = Workbook()
     ws = wb.active
     ws.title = '行块'
     for row in block_rows(items, group):
-        ws.append([v if v != '' else None for v in row])
+        ws.append([_safe(v) for v in row])
     for letter in ('ABCDEFGHIJKLMNOPQRST')[:len(FIELD_ORDER)]:
         ws.column_dimensions[letter].width = 14
 

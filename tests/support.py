@@ -107,8 +107,11 @@ class EntryCase(TempDataTest):
         self.alice_c = self._client()
         self.bob_c = self._client()
 
-        # 第一次设密码不需要旧密码，设完顺手就登录了
-        r = self.purchase.post('/api/purchase/password', json={'new': TEST_PASSWORD})
+        # 第一次设密码不需要旧密码，**但要带初始化码**（防止公网上被抢先夺权），
+        # 设完顺手就登录了
+        r = self.purchase.post('/api/purchase/password',
+                               json={'new': TEST_PASSWORD,
+                                     'setup': settings.setup_code()})
         assert r.status_code == 200, r.text
 
         # 组员客户端：先过口令门，再各自选名字

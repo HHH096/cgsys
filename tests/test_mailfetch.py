@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
 """收信落盘与去重（客户端注入，不碰真实邮箱）。"""
 import unittest
+from unittest import mock
 
 from app import config
 from app.core import mailbox, mailfetch, repo
 from tests.support import TempDataTest
-from tests.test_mailbox import PDF, FakeClient, build_mail
+from tests.test_mailbox import (ALI_LINK, PDF, FakeClient, FakeResp,
+                                build_html_mail, build_mail)
 
 
 class FetchCase(TempDataTest):
@@ -153,6 +155,45 @@ class TestReport(FetchCase):
         text = mailfetch.report_lines(
             mailfetch.collect(mailbox.MailConfig(), client=FakeClient([])))
         self.assertTrue(text and text[0])
+
+
+class TestCollectFromBodyLink(FetchCase):
+    """淘宝/阿里的发票**不是附件**，只在正文 HTML 里放一条下载链接。
+
+    老逻辑只认附件，这种邮件整封被跳过 —— 票就永远进不来（真实故障）。
+    """
+
+    def html_mail(self):
+        html = '<a href="%s">下载发票</a>' % ALI_LINK
+        return [('1', build_html_mail(html).as_bytes())]
+
+    def test_the_link_is_downloaded_and_saved(self):
+        with mock.patch.object(mailbox.urllib.request, 'urlopen',
+                               lambda r, timeout=None: FakeResp(b'%PDF-1.5 from link')):
+            r = mailfetch.collect(self.cfg(), client=FakeClient(self.html_mail()))
+        self.assertTrue(r['ok'], r['message'])
+        self.assertEqual(r['new'], 1, r)
+        rows = repo.list_mail_attachments(status=repo.MAIL_PENDING)
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(rows[0]['orig_name'].endswith('.pdf'), rows[0]['orig_name'])
+        path = config.DATA_DIR / rows[0]['rel_path']
+        self.assertEqual(path.read_bytes(), b'%PDF-1.5 from link')
+
+    def test_turning_the_switch_off_keeps_the_old_behaviour(self):
+        with mock.patch.object(mailbox.urllib.request, 'urlopen',
+                               lambda r, timeout=None: FakeResp(b'%PDF-1.5')):
+            r = mailfetch.collect(self.cfg(link_download=False),
+                                  client=FakeClient(self.html_mail()))
+        self.assertEqual(r['new'], 0)
+
+    def test_a_link_failure_is_reported_but_does_not_abort(self):
+        def boom(r, timeout=None):
+            raise OSError('网络不通')
+        with mock.patch.object(mailbox.urllib.request, 'urlopen', boom):
+            r = mailfetch.collect(self.cfg(), client=FakeClient(self.html_mail()))
+        self.assertTrue(r['ok'])
+        self.assertEqual(r['new'], 0)
+        self.assertTrue(any('链接' in e for e in r['errors']), r['errors'])
 
 
 if __name__ == '__main__':

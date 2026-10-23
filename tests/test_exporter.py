@@ -238,3 +238,33 @@ class TestExportReflectsStatus(TempDataTest):
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
+
+
+class TestFormulaInjection(unittest.TestCase):
+    """导出时**必须防公式注入**。
+
+    openpyxl 会把 `=` 开头的字符串当公式写进单元格。组员在物料名称或备注里
+    填 `=HYPERLINK("http://坏站","点我")`，采购一打开导出的表格就可能被带到外链。
+    前面加单引号，Excel 按普通文本处理。
+    """
+
+    def test_an_equals_prefix_is_escaped(self):
+        got = exporter._blank('=HYPERLINK("http://x","y")')
+        self.assertEqual(got, '\'=HYPERLINK("http://x","y")')
+
+    def test_plus_minus_at_are_escaped_too(self):
+        for s in ('+1+1', '-1+1', '@SUM(A1)'):
+            self.assertTrue(exporter._blank(s).startswith("'"), s)
+
+    def test_normal_text_is_untouched(self):
+        self.assertEqual(exporter._blank('电容 22uF'), '电容 22uF')
+
+    def test_blank_still_becomes_none(self):
+        self.assertIsNone(exporter._blank('   '))
+        self.assertIsNone(exporter._blank(None))
+
+    def test_the_block_export_escapes_as_well(self):
+        from app.core import blockexport
+        self.assertEqual(blockexport._safe('=1+1'), "'=1+1")
+        self.assertEqual(blockexport._safe('排线'), '排线')
+        self.assertIsNone(blockexport._safe(''))

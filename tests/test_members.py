@@ -220,8 +220,17 @@ class TestNoBrowserPrompt(unittest.TestCase):
         self.assertIn('function shortUrl(', self.js)
         seg = self.js.split('if (i === 11 && it.url)')[1].split('tr.appendChild')[0]
         self.assertIn("target = '_blank'", seg)     # 点了在新标签页打开
-        self.assertIn('shortUrl(it.url)', seg)      # 显示短标签
-        self.assertIn('a.title = it.url', seg)      # 悬浮能看完整地址
+        self.assertIn('shortUrl(url)', seg)         # 显示短标签
+        self.assertIn('a.title = url', seg)         # 悬浮能看完整地址
+
+    def test_only_http_links_become_a_real_link(self):
+        """组员能往「网址链接」里塞 `javascript:` —— 那种只当纯文本显示，不给 <a>。
+
+        否则采购一点开，等于在自己电脑上执行组员写的脚本。
+        """
+        seg = self.js.split('if (i === 11 && it.url)')[1].split('tr.appendChild')[0]
+        self.assertIn('/^https?:\\/\\//i.test(url)', seg)
+        self.assertIn('td.textContent = url', seg)   # 不是 http(s) 就走纯文本
 
 
 if __name__ == '__main__':

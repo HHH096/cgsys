@@ -1,14 +1,21 @@
 # -*- coding: utf-8 -*-
 """FastAPI 路由：组员 / 轮次 / 条目 / 状态 / 发票 / 导出 / 静态前端。"""
+import shutil
+import tempfile
 import threading
+import time
 import zipfile
 from contextlib import asynccontextmanager
-from typing import Optional
+from pathlib import Path
+from typing import List, Optional
 
-from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import (Depends, FastAPI, File, Form, HTTPException, Request,
+                     UploadFile)
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from starlette.background import BackgroundTask
+from starlette.concurrency import run_in_threadpool
 
 from app import config
 from app.core import (blockexport, exporter, invoicepdf, invoicematch, invoicing,
@@ -34,12 +41,12 @@ def is_purchase(request: Request) -> bool:
 
 
 def current_member_id(request: Request):
-    """组员选的名字对应的 id（弱身份）。没选就是 None。"""
-    raw = request.cookies.get(settings.MEMBER_COOKIE)
-    try:
-        return int(raw) if raw else None
-    except (TypeError, ValueError):
-        return None
+    """组员选的名字对应的 id。
+
+    **验过签**才认（见 `settings.sign_member`）—— 以前 cookie 里就是明文 id，
+    改一个数字就能冒充别人去改条目、改实付、删发票。
+    """
+    return settings.read_member(request.cookies.get(settings.MEMBER_COOKIE))
 
 
 def _guard_own_item(request: Request, item) -> None:
@@ -69,6 +76,32 @@ MEDIA_TYPES = {
 
 # 单张发票大小上限（局域网自用，防手滑传巨大文件）
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+
+# JSON 请求体上限：正常表单（一两个条目）远小于这个，加个上限防止一个大 body 吃光内存
+MAX_JSON_BYTES = 2 * 1024 * 1024
+
+# 一次「上传合并」最多几个文件：每个文件本身还有 MAX_UPLOAD_BYTES 限制，
+# 但文件数不设上限的话，几十个大文件一起照样能把内存打满
+MAX_MERGE_FILES = 50
+
+
+async def _read_upload(file, limit):
+    """边读边计数，超限立刻停。
+
+    以前是 `await file.read()` 一次性读进来**再**判大小 —— 一个 500MB 的上传会先把
+    内存吃满才被拒绝；服务在公网上时这就是个现成的内存炸弹。
+    """
+    chunks, total = [], 0
+    while True:
+        chunk = await file.read(1024 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > limit:
+            raise HTTPException(400, '文件太大（上限 %d MB）'
+                                % (limit // 1024 // 1024))
+        chunks.append(chunk)
+    return b''.join(chunks)
 
 
 def _mail_loop(stop):
@@ -103,7 +136,10 @@ async def lifespan(_app):
         stop.set()
 
 
-app = FastAPI(title='采购系统', version='0.2.0', lifespan=lifespan)
+# docs / redoc / openapi 全部关掉：这套系统跑在公网上，
+# 没必要把「所有接口和参数」白送给路人 —— 中间件只管 `/api/`，管不到这几个页面。
+app = FastAPI(title='采购系统', version='0.2.0', lifespan=lifespan,
+              docs_url=None, redoc_url=None, openapi_url=None)
 
 
 # 这些路径不用解锁：登录本身，以及页面初始化要用的状态
@@ -146,6 +182,24 @@ async def _require_unlock(request, call_next):
 
 
 @app.middleware('http')
+async def _limit_json_body(request, call_next):
+    """JSON 请求体加个上限 —— 没上限时一个超大 body 就能在解析阶段把内存吃光。
+
+    只盯 `content-type: json` 的请求：上传类端点走 multipart，它们各自有
+    单文件大小和文件数的检查（`MAX_UPLOAD_BYTES` / `MAX_MERGE_FILES`）。
+    """
+    if request.method in ('POST', 'PUT', 'PATCH'):
+        ctype = (request.headers.get('content-type') or '').lower()
+        if 'json' in ctype:
+            cl = request.headers.get('content-length')
+            if cl and cl.isdigit() and int(cl) > MAX_JSON_BYTES:
+                return JSONResponse(
+                    {'detail': '请求体太大（上限 %d KB）' % (MAX_JSON_BYTES // 1024)},
+                    status_code=413)
+    return await call_next(request)
+
+
+@app.middleware('http')
 async def _no_cache_for_the_frontend(request, call_next):
     """页面和静态资源一律「先问服务器，再用缓存」。
 
@@ -159,6 +213,21 @@ async def _no_cache_for_the_frontend(request, call_next):
     if path.endswith(('.js', '.css', '.html')):
         resp.headers['Cache-Control'] = 'no-cache'
     # 页面本身（/ 与 /purchase）由路由设成 no-store，这里不要覆盖它
+    return resp
+
+
+@app.middleware('http')
+async def _security_headers(request, call_next):
+    """几个基本的响应头，挡掉最常见的浏览器侧风险。
+
+    * `nosniff`：别让浏览器把上传的文件猜成别的类型去执行
+    * `SAMEORIGIN`：别被外部站点嵌进 iframe 里骗点击
+    * `same-origin`：跨站请求别带 referer（地址里可能有单号、token）
+    """
+    resp = await call_next(request)
+    resp.headers.setdefault('X-Content-Type-Options', 'nosniff')
+    resp.headers.setdefault('X-Frame-Options', 'SAMEORIGIN')
+    resp.headers.setdefault('Referrer-Policy', 'same-origin')
     return resp
 
 
@@ -224,6 +293,12 @@ class ShareIn(BaseModel):
 
 
 class MailConfigIn(BaseModel):
+    """保存邮箱设置时允许改的字段。
+
+    ⚠️ **这里漏一个字段，前端那个开关就是死的**：Model 里没有声明的字段会被静默丢掉，
+    保存成功、界面看着也勾着，但后端一直是默认值。`link_download` / `scan_read` /
+    `auto_attach` 就都在这里补过 —— 漏过一回，用户以为开了其实没开。
+    """
     host: Optional[str] = None
     port: Optional[int] = None
     user: Optional[str] = None
@@ -237,6 +312,9 @@ class MailConfigIn(BaseModel):
     mark_read: Optional[bool] = None
     max_mails: Optional[int] = None
     auto_interval: Optional[int] = None
+    link_download: Optional[bool] = None    # 正文里只有链接的票（淘宝/阿里）
+    scan_read: Optional[bool] = None        # 也扫已读邮件
+    auto_attach: Optional[bool] = None      # 收到就自动挂到条目上
 
 
 class MailAttachIn(BaseModel):
@@ -264,8 +342,14 @@ class RefundIn(BaseModel):
 
 
 class PaidIn(BaseModel):
-    """补填实付金额。空 = 清掉（比如发现填错了）。"""
+    """补填实付金额。空 = 清掉（比如发现填错了）。
+
+    `base_rev` 是「你看到这条时它的版本号」。带上它，就会在写入前比对：
+    中途被别人改过就拒绝，而不是默默把别人的数字盖掉。
+    不传 = 不检查（脚本、老页面照旧能用）。
+    """
     paid: Optional[float] = None
+    base_rev: Optional[int] = None
 
 
 # ------------------------------------------------------------------ 帮助
@@ -330,8 +414,9 @@ def _invoices_with_links(rid):
     于是另外几条的发票列会是空的（"我明明挂了票，界面上却什么都没有"）。
     """
     out = []
+    links = repo.links_for_invoices(rid)      # 一次查完，不逐票查
     for inv in repo.list_invoices(round_id=rid):
-        inv['item_ids'] = [x['id'] for x in repo.items_of_invoice(inv['id'])]
+        inv['item_ids'] = links.get(inv['id'], [])
         out.append(inv)
     return out
 
@@ -379,8 +464,19 @@ def api_parse_share(body: ShareIn):
 
 
 @app.get('/api/members')
-def api_members():
-    return repo.list_members()
+def api_members(request: Request):
+    """组员列表。
+
+    **组员只拿到 id 和名字**：手机号是别人的隐私，界面上「我是谁」的下拉也用不到它。
+    采购人员拿完整信息（要联系组员、要标负责人）。
+    """
+    rows = repo.list_members()
+    if is_purchase(request):
+        return rows
+    # 组员只要 id/名字/是否负责人（下拉里要显示「（负责人）」）；
+    # **手机号不给他们** —— 那是别人的隐私，界面也用不到。
+    return [{'id': m['id'], 'name': m['name'], 'is_owner': m.get('is_owner')}
+            for m in rows]
 
 
 @app.post('/api/members', dependencies=[Depends(require_purchase)])
@@ -503,7 +599,12 @@ def api_update_item(iid: int, item: ItemIn, request: Request):
     errors, warnings = rules.validate(merged)
     if errors:
         raise HTTPException(400, '；'.join(errors))
-    repo.update_item(iid, data)
+    # 真正的保护在 repo 里（事务内读旧值 + 条件更新）；上面的前置检查只是为了少走一趟
+    try:
+        repo.update_item(iid, data, base_rev=base_rev)
+    except repo.RevConflict:
+        raise HTTPException(409, '这条在你填的时候已经被改过了（现在的内容更新），'
+                                 '请刷新后对照着重新填一次，别把别人填的覆盖掉')
     return {'item': repo.get_item(iid), 'warnings': warnings}
 
 
@@ -556,6 +657,22 @@ def api_item_status(iid: int, body: ItemStatusIn):
     return repo.get_item(iid)
 
 
+@app.get('/api/items/history')
+def api_item_history(name: str = '', limit: int = 5):
+    """「这个物料以前买过什么」—— 填单时一键沿用上次的规格/单价/链接。
+
+    **组员也要能用**（他们才是填单的人），所以这条不挂 `require_purchase`，
+    只靠全局中间件要求已登录（组员口令或采购登录都行）。
+
+    只读、只查同名（不做模糊匹配）：模糊匹配容易把「电容」和「大电容」
+    混成一堆，反而要人再挑一遍。
+    """
+    if not (name or '').strip():
+        return []
+    limit = max(1, min(20, int(limit or 5)))
+    return repo.item_history(name, limit=limit)
+
+
 @app.post('/api/items/{iid}/paid')
 def api_set_paid(iid: int, body: PaidIn, request: Request):
     """补填「实付金额」。
@@ -569,12 +686,24 @@ def api_set_paid(iid: int, body: PaidIn, request: Request):
     """
     item = _item_or_404(iid)
     _guard_own_item(request, item)
+    # 并发：这条在你填的时候被别人改过 → 拦下来，别悄悄把人家的数字盖掉。
+    # 只认「内容」的版本号（和改条目那条接口一个口径）。
+    if body.base_rev is not None and int(item.get('rev') or 0) != int(body.base_rev):
+        raise HTTPException(409, '这条在你填的时候已经被改过了（现在的内容更新），'
+                                 '请刷新后对照着重新填一次，别把别人填的覆盖掉')
     value = rules.to_num(body.paid)
     if value is not None:
         if value < 0:
             raise HTTPException(400, '实付金额不能是负数')
         value = round(value, 2)
-    repo.update_item(iid, {'paid': value})
+    # 真正的保护在 repo 里（事务内条件更新）；上面的前置检查只是为了少走一趟
+    try:
+        repo.update_item(iid, {'paid': value}, base_rev=body.base_rev)
+    except repo.RevConflict:
+        raise HTTPException(409, '这条在你填的时候已经被改过了（现在的内容更新），'
+                                 '请刷新后对照着重新填一次，别把别人填的覆盖掉')
+    # 退货时实付还是空的（退款额因此落成 0），现在才补上 —— 退款额要跟着补记成全额退
+    repo.bump_refund_if_paid_was_empty(iid, value)
     return repo.get_item(iid)
 
 
@@ -590,6 +719,18 @@ def api_pending_invoice(rid: int):
     """还没拿到发票的清单 —— 「要确保每个采购都有发票」。"""
     _round_or_404(rid)
     return repo.items_pending_invoice(rid)
+
+
+@app.get('/api/rounds/{rid}/shopping-list', dependencies=[Depends(require_purchase)])
+def api_shopping_list(rid: int):
+    """待购清单：采购照着它去淘宝下单。
+
+    只给「待下单 + 没退货 + 没人垫付」的条目；每条附一个**清理过的** `link`，
+    因为实测有七成条目的「网址链接」里存的是整段分享文本
+    （`https://e.tb.cn/xxx?tk=yyy CZ028`），带空格，浏览器点不开。
+    """
+    _round_or_404(rid)
+    return repo.shopping_list(rid)
 
 
 # ------------------------------------------------------------------ 发票
@@ -617,11 +758,12 @@ async def api_upload_invoice(iid: int, request: Request, file: UploadFile = File
     item = _item_or_404(iid)
     _guard_own_item(request, item)
     r = repo.get_round(item['round_id'])
-    data = await file.read()
-    if len(data) > MAX_UPLOAD_BYTES:
-        raise HTTPException(400, '文件太大（上限 %d MB）' % (MAX_UPLOAD_BYTES // 1024 // 1024))
+    data = await _read_upload(file, MAX_UPLOAD_BYTES)
     try:
-        rec = invoicing.store_invoice(item, r['name'], file.filename, data)
+        # 图片转 PDF 是纯 CPU 活（一张手机照片 300ms-1s）—— 在这个 async 端点里
+        # 直接同步跑会把**整个事件循环**堵住，另一个人这段时间的所有请求都得排队。
+        rec = await run_in_threadpool(
+            invoicing.store_invoice, item, r['name'], file.filename, data)
     except ValueError as e:
         raise HTTPException(400, str(e))
 
@@ -635,7 +777,8 @@ async def api_upload_invoice(iid: int, request: Request, file: UploadFile = File
             # 老票重传一遍：正好补上一直空着的实付金额
             # （当初是照片票读不出来，现在有 OCR 了，试一次）
             if rules.to_num(item.get('paid')) is None:
-                got = invoicepdf.read_amount_ocr(
+                got = await run_in_threadpool(
+                    invoicepdf.read_amount_ocr,
                     config.DATA_DIR / rec['rel_path'],
                     expect=rules.to_num(item.get('total')))
                 if got is not None:
@@ -663,7 +806,10 @@ async def api_upload_invoice(iid: int, request: Request, file: UploadFile = File
         # 照片 / 扫描件：**没有文字层**，读不出是必然的，只能再上 OCR 试一次。
         # 认出来也只当**建议值**（前端会提示「请核对票面」），认不出照旧让人手填。
         # 拿条目自己的合计去消歧：OCR 常把「¥」认成数字粘上去（¥174 → 4174）。
-        ocr = invoicepdf.read_amount_ocr(
+        # OCR 是**同步的 CPU 活**（一张照片 2~3 秒），直接在事件循环里跑会把整站卡住 ——
+        # 丢到线程池，别人还能正常刷页面。
+        ocr = await run_in_threadpool(
+            invoicepdf.read_amount_ocr,
             path, expect=rules.to_num(item.get('total')) or rules.to_num(item.get('paid')))
         if ocr is not None:
             got, source = ocr, 'ocr'
@@ -672,7 +818,11 @@ async def api_upload_invoice(iid: int, request: Request, file: UploadFile = File
     # 归档那一步发生时条目上还没有金额，文件名会缺金额段；识别出来之后补上，
     # 文件名才跟票面一致（`DQ-硅胶管-29.pdf` 而不是 `DQ-硅胶管.pdf`）。
     if got is not None:
-        repo.update_item(iid, {'paid': got})
+        # **只在实付金额还空着时才预填** —— 人已经填过的数字不能被机器覆盖。
+        # OCR 常把「¥174」认成 4174（¥ 被粘成数字），覆盖之后很难发现，
+        # 还会顺带 rev+1 让别人正在填的保存被 409 拦下。
+        if rules.to_num(item.get('paid')) is None:
+            repo.update_item(iid, {'paid': got})
         rec = invoicing.rename_to_amount(rec, repo.get_item(iid), amount=got)
 
     inv_id = repo.add_invoice(
@@ -779,6 +929,7 @@ def api_merged_pdf(rid: int, per_page: int = 2, back: int = 1, frame: int = 1):
     # 按条目顺序排，同一条目的多张发票按登记顺序
     invoices.sort(key=lambda v: (order.get(v['item_id'], 0), v['id']))
 
+    links = repo.links_for_invoices(rid)      # 一次查完，别逐票查
     entries, missing = [], []
     for inv in invoices:
         path = config.DATA_DIR / inv['rel_path']
@@ -786,7 +937,7 @@ def api_merged_pdf(rid: int, per_page: int = 2, back: int = 1, frame: int = 1):
             # 一张票可能覆盖好几条采购（淘宝一个订单买几样）。
             # 打印仍然**按发票去重**（遍历的就是 invoices 表，一张票一次），
             # 但背面要把涉及的每一样都列出来，不然对不上账。
-            linked = repo.items_of_invoice(inv['id'])
+            linked = [by_id[i] for i in links.get(inv['id'], []) if i in by_id]
             main = by_id.get(inv['item_id']) or (linked[0] if linked else {})
             others = [x['name'] for x in linked if x['id'] != main.get('id')]
             entries.append({'item': main, 'more_names': others,
@@ -812,6 +963,143 @@ def api_merged_pdf(rid: int, per_page: int = 2, back: int = 1, frame: int = 1):
         # 有文件缺失时仍然出成品，但把缺的写进响应头，便于前端提示
         path = path
     return FileResponse(str(path), filename=path.name, media_type='application/pdf')
+
+
+def _parse_round_ids(round_ids, round_id=None):
+    """把前端的「多选轮次」解析成去重后的 id 列表。
+
+    前端沿用 `<select multiple>` 的习惯传法：`round_ids` 是逗号分隔的字符串。
+    为兼容老调用，仍接受单个 `round_id`。
+    """
+    ids = []
+    for chunk in str(round_ids or '').split(','):
+        chunk = chunk.strip()
+        if chunk.lstrip('-').isdigit():
+            v = int(chunk)
+            if v not in ids:
+                ids.append(v)
+    if not ids and round_id:
+        ids.append(int(round_id))
+    return ids
+
+
+def _merge_group(rids, fallback=None):
+    """背面「组别」的兜底值：取所选轮次里第一个有组名的。
+
+    条目自己的 `group_name` 优先（`back_fields` 里就是这么用的），
+    这里只是条目没填时的兜底，所以不必纠结用哪一轮的。
+    """
+    for rid in (rids or []):
+        r = repo.get_round(rid)
+        if r and (r.get('group_name') or '').strip():
+            return r['group_name'].strip()
+    return fallback or config.DEFAULT_GROUP
+
+
+@app.post('/api/merge/custom.pdf', dependencies=[Depends(require_purchase)])
+async def api_merge_custom(
+    request: Request,
+    files: List[UploadFile] = File(...),
+    per_page: int = Form(2),
+    back: int = Form(1),
+    frame: int = Form(1),
+    round_ids: Optional[str] = Form(None),
+    round_id: Optional[int] = Form(None),
+):
+    """从**本机上传**一批发票直接合并成 PDF —— 不走 `invoices` 表，用完即弃。
+
+    给谁用：商家把票开错了、退回去重开，回来的是**几张新的 PDF / 照片**，
+    这时候它们还没进任何一轮的账，但人当场就要合起来打印。
+
+    几个刻意的取舍：
+    * **不落库、不归档**（你说过这类票是返工重开的）—— 转换/合并都在
+      临时目录里做，响应发完立刻删掉。所以重复上传也不会在系统里留痕。
+    * **背面信息靠自动匹配**：拿票面金额（读得到就用）去**所选轮次**的采购条目里配，
+      配上了就印那条的信息，配不上就留空手写（付款日期本来就手写）。
+      轮次可以**多选**（`round_ids=1,2,3`）—— 返工的票常常是上个月那批，
+      所以别把自己锁死在当前这一轮；不选就是全不配、背面留空。
+      匹配**只读**，不会改任何条目的金额或状态。
+    * 图片（jpg/png/bmp/tif…）先转 PDF 再合，跟系统内那套一致。
+    """
+    if not files:
+        raise HTTPException(400, '没有收到文件')
+    if len(files) > MAX_MERGE_FILES:
+        raise HTTPException(400, '一次最多合并 %d 个文件（现在 %d 个）'
+                            % (MAX_MERGE_FILES, len(files)))
+
+    tmp = Path(tempfile.mkdtemp(prefix='cgsys-merge-'))
+    try:
+        entries = []
+        for i, f in enumerate(files):
+            data = await f.read()
+            if not data:
+                continue
+            orig = f.filename or ('file%d' % (i + 1))
+            ext = Path(orig).suffix.lower()
+            if ext not in config.INVOICE_EXTS:
+                raise HTTPException(400, '不支持的文件类型：%s（支持 %s）'
+                                    % (ext or '(无后缀)', '、'.join(sorted(config.INVOICE_EXTS))))
+            if len(data) > MAX_UPLOAD_BYTES:
+                raise HTTPException(400, '文件太大（上限 %d MB）：%s'
+                                    % (MAX_UPLOAD_BYTES // 1024 // 1024, orig))
+            if ext in invoicing.IMAGE_EXTS:
+                try:
+                    data = invoicing.image_to_pdf(data)
+                except ValueError as e:
+                    raise HTTPException(400, '%s：%s' % (orig, e))
+            dst = tmp / ('%03d.pdf' % i)
+            dst.write_bytes(data)
+            # 票面名 / 金额读得到就读，用于**自动匹配**和背面小字；读不到也不拦着。
+            amount = invoicepdf.read_amount(dst)
+            lines = invoicepdf.read_lines(dst)
+            name = lines[0]['name'] if lines else ''
+            entries.append({'key': '%d' % i, 'orig': orig, 'path': dst,
+                            'amount': amount, 'name': name})
+
+        if not entries:
+            raise HTTPException(400, '上传的文件都是空的')
+
+        # 拿**所选轮次**的条目自动匹配（只读）。一轮没选、或选了但没条目，也能合，只是背面留空。
+        rids = _parse_round_ids(round_ids, round_id)
+        items = []
+        for rid in rids:
+            items.extend(repo.list_items(rid))
+        by_id = {it['id']: it for it in items}
+        taken = invoicematch.match_invoices_to_items(
+            [{'key': e['key'], 'name': e['name'], 'amount': e['amount']} for e in entries],
+            items)
+
+        merged = []
+        for e in entries:
+            it = by_id.get(taken.get(e['key']))
+            merged.append({
+                'item': it or {},
+                'more_names': [],
+                'invoice': {'amount': e['amount'], 'orig_name': e['orig']},
+                'path': e['path'],
+            })
+
+        opts = invoicepdf.MergeOptions(
+            per_page=max(1, min(4, per_page)),
+            make_back=bool(back),
+            show_back_frame=bool(frame),
+            show_back_line=bool(frame),
+            group=_merge_group(rids),
+        )
+        out = tmp / 'merged.pdf'
+        invoicepdf.build_merged_pdf(merged, out, opts)
+
+        # 文件名带上日期，方便跟系统内合出来的区分
+        stamp = time.strftime('%Y%m%d-%H%M%S')
+        return FileResponse(str(out), filename='发票合并_外部上传_%s.pdf' % stamp,
+                            media_type='application/pdf',
+                            background=BackgroundTask(shutil.rmtree, str(tmp), True))
+    except HTTPException:
+        shutil.rmtree(str(tmp), ignore_errors=True)
+        raise
+    except Exception:
+        shutil.rmtree(str(tmp), ignore_errors=True)
+        raise
 
 
 # ------------------------------------------------------------------ 发票打包下载
@@ -960,6 +1248,30 @@ def api_mail_attach(body: MailAttachIn):
         raise HTTPException(400, str(e))
 
 
+@app.get('/api/mail/pending/{mid}/file', dependencies=[Depends(require_purchase)])
+def api_mail_file(mid: int, download: int = 0):
+    """看**还没归档**的那张发票 —— 挂之前得先看清票面，才知道该挂到哪一笔上。
+
+    为什么单开一条：归档后的票走 `/api/invoices/{id}/file`，
+    而待归档的票还没进 `invoices` 表，那条路取不到它。
+    """
+    row = repo.get_mail_attachment(mid)
+    if not row:
+        raise HTTPException(404, '这条待归档记录不存在')
+    path = (config.DATA_DIR / row['rel_path']).resolve()
+    # 防路径穿越：rel_path 是库里记的，正常都在 data/ 下；
+    # 万一被改过，别让它读到 data 之外去。
+    try:
+        path.relative_to(Path(config.DATA_DIR).resolve())
+    except ValueError:
+        raise HTTPException(400, '这条记录的路径不对')
+    if not path.exists():
+        raise HTTPException(404, '发票文件找不到了：%s' % row['rel_path'])
+    return FileResponse(str(path), filename=row['stored_name'],
+                        media_type=_media_type(row['stored_name']),
+                        content_disposition_type='attachment' if download else 'inline')
+
+
 @app.delete('/api/mail/pending/{mid}', dependencies=[Depends(require_purchase)])
 def api_mail_ignore(mid: int):
     if not mailfetch.ignore(mid):
@@ -979,11 +1291,19 @@ def api_set_invoice_items(iid: int, body: InvoiceItemsIn, request: Request):
     - 组员：只能把**自己的**票挂到**自己的**条目上 —— 一张票覆盖他自己
       买的几样很方便，又不会碰到别人的账。
     """
-    if not repo.get_invoice(iid):
+    inv = repo.get_invoice(iid)
+    if not inv:
         raise HTTPException(404, '发票不存在')
     targets = [repo.get_item(x) for x in body.item_ids]
     if any(t is None for t in targets):
         raise HTTPException(400, '选的条目不存在')
+    # 一张票只能挂在**同轮次**的条目上。跨轮挂的话，合并打印、打包 zip、
+    # 「缺发票」清单都是按 `invoices.round_id` 查的 —— 那张票会完全查不到，
+    # 等于凭空消失（而且不报错，最难发现）。
+    if any(t['round_id'] != inv['round_id'] for t in targets):
+        rnd = repo.get_round(inv['round_id']) or {}
+        raise HTTPException(409, '这张票属于「%s」，只能挂到同一轮次的条目上'
+                                 % (rnd.get('name') or '另一个轮次'))
 
     if not is_purchase(request):
         mid = current_member_id(request)
@@ -1014,16 +1334,26 @@ def api_assign_invoice(iid: int, body: InvoiceAssignIn, request: Request):
     顺带把每条的「实付金额」按核对的数填上 —— 明细金额本来就是按条目分的，
     不填的话那条还是空的。
     """
-    if not repo.get_invoice(iid):
+    inv = repo.get_invoice(iid)
+    if not inv:
         raise HTTPException(404, '发票不存在')
 
     rows = [r for r in body.lines if r.get('item_id')]
     targets = []
     for row in rows:
-        it = repo.get_item(int(row['item_id']))
+        try:
+            target_id = int(row['item_id'])
+        except (TypeError, ValueError):
+            raise HTTPException(400, '条目 id 不是数字：%s' % row['item_id'])
+        it = repo.get_item(target_id)
         if it is None:
             raise HTTPException(400, '选的条目不存在：%s' % row['item_id'])
         targets.append(it)
+    # 和「改挂」同一条规矩：一张票只能挂在同一轮次的条目上
+    if any(t['round_id'] != inv['round_id'] for t in targets):
+        rnd = repo.get_round(inv['round_id']) or {}
+        raise HTTPException(409, '这张票属于「%s」，只能挂到同一轮次的条目上'
+                                 % (rnd.get('name') or '另一个轮次'))
 
     if not is_purchase(request):
         mid = current_member_id(request)
@@ -1034,16 +1364,23 @@ def api_assign_invoice(iid: int, body: InvoiceAssignIn, request: Request):
         if any(t.get('member_id') != mid for t in targets):
             raise HTTPException(403, '只能挂到自己填的条目上')
 
+    # 先把金额都校验完再动库 —— 免得写了一半才发现某个是负数
+    checked = []
+    for row in rows:
+        paid = rules.to_num(row.get('paid'))
+        if paid is not None and paid < 0:
+            raise HTTPException(400, '实付金额不能是负数')
+        checked.append(paid)
+
     keep = [t['id'] for t in targets]
     # 没被提到的就摘掉（这一步带"改挂"的语义）
     for x in repo.items_of_invoice(iid):
         if x['id'] not in keep:
             repo.unlink_invoice(iid, x['id'])
-    for t, row in zip(targets, rows):
+    for t, paid in zip(targets, checked):
         repo.link_invoice(iid, t['id'])
-        paid = row.get('paid')
         if paid is not None:
-            repo.update_item(t['id'], {'paid': round(float(paid), 2)})
+            repo.update_item(t['id'], {'paid': round(paid, 2)})
 
     # 核对落库后归属可能变了 → 名字跟着改
     _rename_invoice_by_links(iid)
@@ -1059,6 +1396,7 @@ class LoginIn(BaseModel):
 class PasswordIn(BaseModel):
     old: str = ''
     new: str = ''
+    setup: str = ''      # 首次设密码时的初始化码（见 settings.setup_code）
 
 
 class MeIn(BaseModel):
@@ -1105,14 +1443,26 @@ def api_purchase_logout(request: Request, response: Response):
 
 @app.post('/api/purchase/password')
 def api_purchase_password(body: PasswordIn, request: Request, response: Response):
-    """还没设过密码时允许直接设（否则没人能进去设）；改密码则必须已登录 + 验旧密码。"""
+    """还没设过密码时允许直接设（否则没人能进去设）；改密码则必须已登录 + 验旧密码。
+
+    **首次设密码要带初始化码**：这个路由必须能匿名调用（不然死锁），
+    但服务一旦暴露到公网，路人也能抢先设密码把采购权限拿走。
+    初始化码只写在服务器的 `data/setup-code.txt` 和启动日志里。
+    """
     if settings.has_password():
         require_purchase(request)
         if not settings.check_password(body.old):
             raise HTTPException(401, '原密码不对')
+    else:
+        settings.setup_code()          # 保证码文件存在（首次部署/从老版本升级上来时）
+        if not settings.verify_setup_code(body.setup):
+            raise HTTPException(403, '初始化码不对（或没填）。它写在服务器的 '
+                                     'data/setup-code.txt 里，启动日志也会打印一行'
+                                     '「采购入口初始化码」；用 SSH 登录服务器就能看到。')
     if len(body.new or '') < 4:
         raise HTTPException(400, '密码至少 4 位')
     settings.set_password(body.new)
+    settings.clear_setup_code()                 # 设好了就把初始化码删掉
     settings.reset_state()                      # 旧的登录全部失效
     _set_purchase_cookie(response, settings.issue_token())
     return {'ok': True, 'relogin': True}
@@ -1165,7 +1515,11 @@ def api_set_member_password(body: MemberPasswordIn):
     if body.password and len(body.password) < 4:
         raise HTTPException(400, '口令至少 4 位')
     settings.set_member_password(body.password)
-    return {'ok': True, 'has_password': settings.has_member_password()}
+    # 口令改了/关了，老组员手里的 cookie 必须当场失效 ——
+    # 不然「关掉入口」只是关了个门，钥匙还能开 30 天。
+    revoked = settings.revoke_kind(settings.KIND_MEMBER)
+    return {'ok': True, 'has_password': settings.has_member_password(),
+            'revoked': revoked}
 
 
 # ------------------------------------------------------------------ 组员身份
@@ -1193,7 +1547,7 @@ def api_set_me(body: MeIn, response: Response):
     m = repo.get_member(body.member_id)
     if not m:
         raise HTTPException(404, '没有这个组员')
-    response.set_cookie(settings.MEMBER_COOKIE, str(m['id']),
+    response.set_cookie(settings.MEMBER_COOKIE, settings.sign_member(m['id']),
                         httponly=True, samesite='lax', path='/')
     return {'member_id': m['id'], 'name': m['name']}
 
@@ -1231,7 +1585,9 @@ def api_progress(rid: int):
         'invoiced': invoiced,
         'need_invoice': len(live) - invoiced,
         'invoice_sheets': sheets,           # 发票文件张数
-        'amount': round(sum(float(i.get('amount') or 0) for i in items), 2),
+        # items 表**没有 amount 列**（只有 qty/price/freight/paid），
+        # 以前这行永远算出 0。用「合计金额」汇总才是有意义的钱数。
+        'amount': round(sum(float(i.get('total') or 0) for i in items), 2),
     }
 
 
@@ -1298,6 +1654,18 @@ def api_page():
     藏页面挡不住直接调接口。
     """
     return HTMLResponse(_page_html(), headers={'Cache-Control': 'no-store'})
+
+
+@app.get('/api/rounds/{rid}/payers', dependencies=[Depends(require_purchase)])
+def api_payers(rid: int):
+    """垫付结算：这轮「谁自己先掏了多少」，按金额从大到小。
+
+    `payer` 一直只标在行上，从没汇总过。可钱的事总要有人问一句
+    「这轮谁垫了多少、该给谁转账」—— 一条条翻列表不现实。
+    退货按净额算（`rules.item_net_paid`）。
+    """
+    _round_or_404(rid)
+    return repo.payer_summary(rid)
 
 
 app.mount('/', StaticFiles(directory=str(config.WEB_DIR), html=True), name='web')

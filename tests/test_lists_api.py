@@ -277,3 +277,31 @@ class TestRoundDetailPayload(ApiCase):
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
+
+
+class TestSwitchingRoundSafely(unittest.TestCase):
+    """切轮次失败时**不能**留下「下拉是 A、表格是 B」的状态。
+
+    那时人以为在看新轮次，实际改的是上一轮的行 —— 这是真会改错数据的一类错。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from pathlib import Path
+        cls.js = (Path(__file__).resolve().parent.parent / 'app/web/app.js').read_text(
+            encoding='utf-8')
+
+    def test_a_failed_switch_puts_the_dropdown_back(self):
+        seg = self.js.split('async function loadRound(')[1].split('\n}')[0]
+        self.assertIn('try {', seg)
+        self.assertIn('catch (e)', seg)
+        self.assertIn("sel.value = state.round ? String(state.round.id) : ''", seg)
+
+    def test_it_tells_the_user_instead_of_failing_silently(self):
+        seg = self.js.split('async function loadRound(')[1].split('\n}')[0]
+        self.assertIn('切轮次失败', seg)
+
+    def test_a_stale_response_is_still_discarded(self):
+        """慢请求后到不能覆盖新轮次的数据。"""
+        seg = self.js.split('async function loadRound(')[1].split('\n}')[0]
+        self.assertIn('if (seq !== _roundSeq) return;', seg)

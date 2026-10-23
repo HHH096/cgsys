@@ -141,12 +141,21 @@ class TestSettingTheMemberPassword(EntryCase):
         self.assertEqual(r.status_code, 200)
         self.assertFalse(r.json()['has_password'])
 
-    def test_changing_it_invalidates_nothing_already_inside(self):
-        """改口令不影响已经进来的人（他们的凭证还在）—— 这是有意的：
-        不然改一次口令全班都得重新进。"""
-        self.purchase.post('/api/purchase/member-password',
-                           json={'password': 'brand-new-pw'})
-        self.assertEqual(self.alice_c.get('/api/rounds').status_code, 200)
+    def test_changing_it_kicks_the_members_out(self):
+        """改口令 / 关口令之后，老组员手里的 cookie 立刻失效。
+
+        以前是「不踢人」—— 用起来省事，但等于**关了门钥匙还能开 30 天**：
+        口令本来就发在群里，改掉之后老口令仍然有效的那段时间是真实的风险窗口。
+        采购自己的登录不受影响（吊销按身份分类，见 settings.revoke_kind）。
+        """
+        r = self.purchase.post('/api/purchase/member-password',
+                               json={'password': 'brand-new-pw'})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertGreater(r.json().get('revoked', 0), 0, '应当吊销了老令牌')
+        self.assertEqual(self.alice_c.get('/api/rounds').status_code, 401,
+                         '老 cookie 必须失效')
+        self.assertEqual(self.purchase.get('/api/rounds').status_code, 200,
+                         '采购自己不该被踢')
 
 
 class TestTheFirstRunIsNotLockedOut(EntryCase):
@@ -159,10 +168,27 @@ class TestTheFirstRunIsNotLockedOut(EntryCase):
     def test_purchase_password_can_be_set_before_any_login(self):
         settings.reset_state()                 # 清掉所有登录
         settings.set_password('')
+        settings.clear_setup_code()
         fresh = self._client()
-        r = fresh.post('/api/purchase/password', json={'new': 'brand-new'})
+        # 初始化码只写在服务器上（这里从 settings 取，等价于 SSH 上去看那个文件）
+        r = fresh.post('/api/purchase/password',
+                       json={'new': 'brand-new', 'setup': settings.setup_code()})
         self.assertEqual(r.status_code, 200, r.text)
         self.assertTrue(fresh.get('/api/purchase/status').json()['logged_in'])
+
+    def test_a_stranger_without_the_code_cannot_claim_the_purchase_entry(self):
+        """**知道网址不等于能夺权** —— 没有服务器上的初始化码就设不了密码。
+
+        这条和上一条是一对：既要「全新安装不会死锁」（能设），
+        又要「公网路人抢不了」（别人设不了）。
+        """
+        settings.reset_state()
+        settings.set_password('')
+        settings.clear_setup_code()
+        fresh = self._client()
+        r = fresh.post('/api/purchase/password', json={'new': 'brand-new'})
+        self.assertEqual(r.status_code, 403, r.text)
+        self.assertFalse(settings.has_password(), '密码不该被路人设上')
 
     def test_meta_is_readable_while_locked(self):
         r = self.anon.get('/api/meta')

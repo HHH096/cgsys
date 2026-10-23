@@ -17,6 +17,7 @@ import uvicorn
 from openpyxl import load_workbook
 
 from app import config
+from app.core import settings
 from app.server.api import app
 from tests.support import temp_config_patches
 
@@ -86,11 +87,14 @@ class LiveServerCase(unittest.TestCase):
     def login_purchase(self, password='test-pw'):
         """接口现在分「采购人员」和「组员」两种身份，采购专用接口必须登录。
 
-        第一次是「还没设过密码」，可以直接设；之后就要走登录接口了。
+        第一次是「还没设过密码」，可以直接设（但要带服务器上的初始化码，
+        防止公网上被人抢先夺权）；之后就要走登录接口了。
         """
         st = self.client.get('/api/purchase/status').json()
         if not st['has_password']:
-            r = self.client.post('/api/purchase/password', json={'new': password})
+            r = self.client.post('/api/purchase/password',
+                                 json={'new': password,
+                                       'setup': settings.setup_code()})
         else:
             r = self.client.post('/api/purchase/login', json={'password': password})
         self.assertEqual(r.status_code, 200, r.text)

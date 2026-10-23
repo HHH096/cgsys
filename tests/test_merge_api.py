@@ -183,6 +183,43 @@ class TestFrontendWiring(unittest.TestCase):
     def test_hint_is_updated_when_rendering(self):
         self.assertIn('renderMerge();', self.js)
 
+    def test_the_preview_container_exists(self):
+        for needle in ('id="mergePreviewBox"', 'id="mergePreviewFrame"',
+                       'id="mergePreviewTitle"', 'id="mergePreviewHint"',
+                       'id="mergePreviewDownload"', 'id="mergePreviewPrint"',
+                       'id="mergePreviewClose"'):
+            self.assertIn(needle, self.html, 'index.html 缺 %s' % needle)
+
+    def test_both_entries_feed_the_same_preview(self):
+        """系统内合并、本机上传合并 —— 两个入口都要**先看再印**，出口是同一个预览。"""
+        for fn in ('async function mergePdf(', 'async function mergeUpload('):
+            seg = self.js.split(fn)[1].split('\n}')[0]
+            self.assertIn('showMergePreview(', seg, '%s 没走预览' % fn)
+
+    def test_it_no_longer_downloads_or_opens_a_window(self):
+        """直接在 fetch 里取 blob 来预览 —— 不能再 window.open 或偷偷存进下载文件夹。"""
+        seg = self.js.split('async function mergePdf(')[1].split('\n}')[0]
+        self.assertNotIn('window.open(', seg)
+        self.assertNotIn('a.download', seg)
+
+    def test_the_upload_entry_no_longer_auto_downloads(self):
+        seg = self.js.split('async function mergeUpload(')[1].split('\n}')[0]
+        self.assertNotIn('a.click()', seg)
+        self.assertNotIn("a.download = '发票合并_外部上传.pdf'", seg)
+
+    def test_the_preview_buttons_are_bound(self):
+        for fn in ('closeMergePreview', 'downloadMergePreview', 'printMergePreview'):
+            self.assertIn("addEventListener('click', %s)" % fn, self.js)
+
+    def test_the_blob_url_is_released(self):
+        """每次预览先放掉上一份、关闭时也放掉，否则每合一次漏几 MB。"""
+        self.assertIn('URL.revokeObjectURL(_mergePreviewUrl)', self.js)
+        self.assertIn('closeMergePreview();', self.js)
+
+    def test_the_preview_hides_by_default(self):
+        """没合过之前不该占着版面。"""
+        self.assertIn('id="mergePreviewBox" class="preview-box" hidden', self.html)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 
 from app import config
 from app.core import mailfetch, mailbox, repo
+from app.core.db import session
 from app.server.api import app
 from tests.support import TempDataTest, purchase_client
 from tests.test_mailbox import FakeClient, build_mail
@@ -21,9 +22,13 @@ class MailApiCase(TempDataTest):
         self.client = purchase_client(self)
 
     def seed_pending(self, subject='电子发票', filename='invoice.pdf'):
-        """造一条待归档记录（直接调 core，不经过 HTTP）。"""
+        """造一条待归档记录（直接调 core，不经过 HTTP）。
+
+        `auto_attach=False`：这些用例要的是「票留在待归档、并给出建议」，
+        自动挂会把它直接挂走（那条逻辑由 tests/test_auto_attach.py 专门覆盖）。
+        """
         cfg = mailbox.MailConfig(host='imap.example.com', user='a@example.com',
-                                 password='x', days=0)
+                                 password='x', days=0, auto_attach=False)
         r = mailfetch.collect(cfg, client=FakeClient(
             [('1', build_mail(subject=subject, filename=filename).as_bytes())]))
         self.assertTrue(r['ok'], r['message'])
@@ -208,5 +213,127 @@ class TestFrontendWiring(unittest.TestCase):
         self.assertIn('授权码不是登录密码', self.html)
 
 
+class TestPendingFileApi(MailApiCase):
+    """待归档的发票要能**先看再挂** —— 看不到票面就不知道该挂哪一笔。
+
+    归档后的票有 /api/invoices/{id}/file，但待归档的还没进 invoices 表，
+    得另开一条，否则「待归档」里的票谁都打不开。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.row = self.seed_pending()
+
+    def test_inline_by_default(self):
+        r = self.client.get('/api/mail/pending/%d/file' % self.row['id'])
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.headers['content-type'], 'application/pdf')
+        self.assertIn('inline', r.headers.get('content-disposition', ''))
+        self.assertEqual(r.content, b'%PDF-1.4 fake invoice')
+
+    def test_download_asks_for_an_attachment(self):
+        r = self.client.get('/api/mail/pending/%d/file?download=1' % self.row['id'])
+        self.assertEqual(r.status_code, 200)
+        self.assertIn('attachment', r.headers.get('content-disposition', ''))
+
+    def test_a_missing_record_is_404(self):
+        self.assertEqual(self.client.get('/api/mail/pending/9999/file').status_code, 404)
+
+    def test_a_vanished_file_is_404_not_a_crash(self):
+        (config.DATA_DIR / self.row['rel_path']).unlink()
+        self.assertEqual(self.client.get('/api/mail/pending/%d/file' % self.row['id']).status_code,
+                         404)
+
+    def test_a_path_outside_the_data_dir_is_refused(self):
+        """rel_path 万一被改过，不能让它读到 data/ 之外去。"""
+        with session() as c:
+            c.execute('UPDATE mail_inbox SET rel_path = ? WHERE id = ?',
+                      ('../../etc/passwd', self.row['id']))
+        r = self.client.get('/api/mail/pending/%d/file' % self.row['id'])
+        self.assertEqual(r.status_code, 400)
+
+    def test_anonymous_is_401(self):
+        from app.server.api import app as the_app
+        anon = TestClient(the_app)
+        self.assertEqual(anon.get('/api/mail/pending/%d/file' % self.row['id']).status_code, 401)
+
+
+class TestPendingCardWiring(unittest.TestCase):
+    """卡片上得有「看发票」/「下载」，否则又回到「看不到票就挂不了」。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.js = (ROOT / 'app/web/app.js').read_text(encoding='utf-8')
+
+    def test_the_card_links_to_the_pending_file(self):
+        self.assertIn("openFileViewer('/api/mail/pending/' + mid + '/file'", self.js)
+
+    def test_it_offers_both_look_and_download(self):
+        self.assertIn("look.textContent = '看发票'", self.js)
+        self.assertIn("save.textContent = '下载'", self.js)
+        self.assertIn("/file?download=1", self.js)
+
+    def test_they_are_actually_appended_to_the_row(self):
+        """写了控件忘了 append 就等于没加 —— 这个坑真踩过。"""
+        self.assertIn('row2.append(look, save, sel, go, del)', self.js)
+
+    def test_the_attached_card_points_at_the_archived_invoice(self):
+        """挂完待归档那份文件就删了，得指向归档后的票，不然点开 404。"""
+        self.assertIn("openFileViewer('/api/invoices/' + invId + '/file'", self.js)
+
+    def test_look_opens_the_in_page_viewer_not_a_new_tab(self):
+        """新标签页关起来太别扭（用户反馈过）—— 必须是页面内弹层。"""
+        self.assertIn('function openFileViewer(', self.js)
+        self.assertIn('viewPendingFile(r.id, r.stored_name)', self.js)
+        self.assertIn('viewInvoiceFile(r.invoice_id, r.stored_name)', self.js)
+        # 不能再走 target=_blank 那条路
+        for seg in self.js.split('look.textContent')[1:]:
+            self.assertNotIn("look.target = '_blank'", seg.split('save.textContent')[0])
+
+    def test_the_viewer_can_be_closed_three_ways(self):
+        self.assertIn("$('fileViewerClose').addEventListener('click', closeFileViewer)", self.js)
+        self.assertIn('closeFileViewer()', self.js)
+        self.assertIn("e.key === 'Escape'", self.js)
+
+    def test_the_viewer_container_exists(self):
+        html = (ROOT / 'app/web/index.html').read_text(encoding='utf-8')
+        for needle in ('id="fileViewer"', 'id="fileViewerFrame"', 'id="fileViewerTitle"',
+                       'id="fileViewerClose"', 'id="fileViewerDownload"'):
+            self.assertIn(needle, html, 'index.html 缺 %s' % needle)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
+
+
+class TestTheSwitchesActuallySave(MailApiCase):
+    """**前端那些勾选框必须真的存进配置**。
+
+    踩过的坑：`MailConfigIn` 里没声明某个字段时，请求里的它会被**静默丢掉** ——
+    保存返回 200、界面看着也勾着，但后端一直是默认值，用户以为开了其实没开。
+    所以每个开关都要有一条「存进去再读回来」的断言。
+    """
+
+    def save_and_read(self, **flags):
+        r = self.client.put('/api/mail/config', json=flags)
+        self.assertEqual(r.status_code, 200, r.text)
+        return self.client.get('/api/mail/config').json()
+
+    def test_auto_attach_round_trips(self):
+        self.assertFalse(self.save_and_read(auto_attach=False)['auto_attach'])
+        self.assertTrue(self.save_and_read(auto_attach=True)['auto_attach'])
+
+    def test_link_download_round_trips(self):
+        self.assertFalse(self.save_and_read(link_download=False)['link_download'])
+        self.assertTrue(self.save_and_read(link_download=True)['link_download'])
+
+    def test_scan_read_round_trips(self):
+        self.assertTrue(self.save_and_read(scan_read=True)['scan_read'])
+        self.assertFalse(self.save_and_read(scan_read=False)['scan_read'])
+
+    def test_the_defaults_are_the_sensible_ones(self):
+        """没配过时：正文链接要抓（不然淘宝发票收不到）、自动挂开着。"""
+        got = self.client.get('/api/mail/config').json()
+        self.assertTrue(got['link_download'])
+        self.assertTrue(got['auto_attach'])
+        self.assertFalse(got['scan_read'])
